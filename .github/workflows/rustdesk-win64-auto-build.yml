@@ -23,6 +23,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
 
 jobs:
   # ============================================================================
@@ -106,6 +108,8 @@ jobs:
       FLUTTER_VERSION: ${{ needs.check-upstream.outputs.flutter_version }}
       FLUTTER_RUST_BRIDGE_VERSION: ${{ needs.check-upstream.outputs.frb_version }}
       VCPKG_COMMIT_ID: ${{ needs.check-upstream.outputs.vcpkg_commit }}
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - name: Export GitHub Actions cache environment variables (for vcpkg x-gha)
         uses: actions/github-script@v7
@@ -129,24 +133,32 @@ jobs:
         shell: pwsh
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
           # 如需可选内置自建服务器，可在仓库 Settings -> Secrets and variables -> Actions 中添加以下 Secrets：
           RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
           RELAY_SERVER: ${{ secrets.RELAY_SERVER }}
           API_SERVER: ${{ secrets.API_SERVER }}
           RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
         run: |
-          # 自动清理复制粘贴时可能误带的 ```python 或 ``` Markdown 代码块标记
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $patchPath = ".\custom-scripts\patch_rustdesk.py"
           if (Test-Path $patchPath) {
-            $cleaned = Get-Content $patchPath -Encoding UTF8 | Where-Object { $_ -notmatch '^\s*```' }
-            $cleaned | Set-Content $patchPath -Encoding UTF8
+            # 1. 自动清理误带的 ``` Markdown 代码块标记
+            # 2. 若文件被不小心重复粘贴了两遍 (main()#!/usr/bin/env python3)，自动截断保留第一份
+            $raw = Get-Content $patchPath -Raw -Encoding UTF8
+            $raw = $raw -replace '(?m)^\s*```.*$', ''
+            if ($raw -match 'main\(\)\s*#!/usr/bin/env python3') {
+              $raw = ($raw -split 'main\(\)\s*#!/usr/bin/env python3')[0] + "main()`n"
+            }
+            Set-Content -Path $patchPath -Value $raw -Encoding UTF8
           }
-          python $patchPath --root .\rustdesk-src --repo "${{ github.repository }}"
+          python -X utf8 $patchPath --root .\rustdesk-src --repo "${{ github.repository }}"
 
       - name: Setup vcpkg with GitHub Actions binary cache
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgDirectory: ${{ runner.workspace }}/vcpkg
+          vcpkgDirectory: C:\vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
 
       - name: Install Windows native dependencies via vcpkg manifest
@@ -198,14 +210,14 @@ jobs:
         run: |
           pip install -r libs/portable/requirements.txt
           # 先编译 Rust 核心库与 Flutter Windows 界面（暂不打包单文件，以便注入 usbmmidd_v2 虚拟显示器驱动）
-          python build.py --portable --flutter --hwcodec --vram --skip-portable-pack
+          python -X utf8 build.py --portable --flutter --hwcodec --vram --skip-portable-pack
           # 下载并解压官方 usbmmidd_v2 虚拟显示器驱动到 Release 目录
           Invoke-WebRequest -Uri "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip" -OutFile "usbmmidd_v2.zip"
           Expand-Archive -Path "usbmmidd_v2.zip" -DestinationPath "flutter\build\windows\x64\runner\Release" -Force
           Remove-Item "usbmmidd_v2.zip" -Force
           # 打包为单文件安装程序 rustdesk-<version>-install.exe
           cd libs/portable
-          python ./generate.py -f ../../flutter/build/windows/x64/runner/Release -o . -e ../../flutter/build/windows/x64/runner/Release/rustdesk.exe
+          python -X utf8 ./generate.py -f ../../flutter/build/windows/x64/runner/Release -o . -e ../../flutter/build/windows/x64/runner/Release/rustdesk.exe
           cd ../..
           Move-Item -Path "./target/release/rustdesk-portable-packer.exe" -Destination "./rustdesk-${{ env.VERSION }}-install.exe" -Force
           Copy-Item "./rustdesk-${{ env.VERSION }}-install.exe" "./rustdesk-${{ env.VERSION }}-x86_64.exe" -Force
