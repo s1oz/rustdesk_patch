@@ -104,7 +104,7 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
         )
         if pattern_simple.search(content):
             content = pattern_simple.sub(
-                rf'\1let mut config = Config::load_::<Config2>("2");' + "\n" + config2_inject_block + "\n        config\n    " + r'\2',
+                r'\1let mut config = Config::load_::<Config2>("2");' + "\n" + config2_inject_block + "\n        config\n    " + r'\2',
                 content,
                 count=1,
             )
@@ -183,7 +183,10 @@ def patch_hide_cm_popup(root: Path) -> None:
         rust_candidates.extend((root / "libs").rglob("*.rs"))
 
     for rs_file in rust_candidates:
-        text = read_text(rs_file)
+        try:
+            text = read_text(rs_file)
+        except UnicodeDecodeError:
+            continue
         orig = text
 
         # 如果存在 fn allow_hide_cm() -> bool 或类似函数，强制返回 true
@@ -217,7 +220,10 @@ def patch_hide_cm_popup(root: Path) -> None:
     for dart_file in flutter_dir.rglob("*.dart"):
         if "cm" not in dart_file.name.lower() and "main" not in dart_file.name.lower():
             continue
-        text = read_text(dart_file)
+        try:
+            text = read_text(dart_file)
+        except UnicodeDecodeError:
+            continue
         orig = text
 
         # 消除 CM 窗口显示的 3 秒延迟 (Timer(const Duration(seconds: 3), () => windowManager.hide()))
