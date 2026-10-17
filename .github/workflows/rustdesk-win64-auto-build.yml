@@ -174,8 +174,12 @@ jobs:
       - name: Setup LLVM (for bindgen & flutter_rust_bridge)
         shell: pwsh
         run: |
-          choco install -y llvm --version=15.0.6 --allow-downgrade
+          # windows-2022 镜像默认已预装 64位 LLVM (C:\Program Files\LLVM\bin)，直接复用；若不存在才通过 choco 安装最新版
+          if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+            choco install -y llvm
+          }
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Setup Rust stable toolchain (x86_64-pc-windows-msvc)
         uses: dtolnay/rust-toolchain@stable
@@ -198,11 +202,12 @@ jobs:
         shell: pwsh
         working-directory: rustdesk-src
         run: |
+          flutter config --enable-windows-desktop
           cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
           cd flutter
           flutter pub get
           cd ..
-          flutter_rust_bridge_codegen --rust-input .\src\flutter_ffi.rs --dart-output .\flutter\lib\generated_bridge.dart
+          flutter_rust_bridge_codegen --rust-input .\src\flutter_ffi.rs --dart-output .\flutter\lib\generated_bridge.dart --c-output .\flutter\macos\Runner\bridge_generated.h --llvm-path "C:\Program Files\LLVM"
 
       - name: Build RustDesk Windows x64 & Bundle Virtual Display Driver
         shell: pwsh
