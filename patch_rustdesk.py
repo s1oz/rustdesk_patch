@@ -191,7 +191,7 @@ def patch_hide_cm_popup(root: Path) -> None:
         # Force pub fn hide_cm() -> bool and pub fn allow_hide_cm() -> bool to return true immediately
         text = re.sub(
             r'(pub\s+fn\s+(?:allow_)?hide_cm\s*\([^)]*\)\s*->\s*bool\s*\{)',
-            r'\1 return true;',
+            r'\1 #[allow(unreachable_code)] return true;',
             text,
         )
         # Match optional module prefix (e.g. crate::config::option2bool) so we don't produce crate::config::true
