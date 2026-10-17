@@ -171,8 +171,9 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
 def patch_hide_cm_popup(root: Path) -> None:
     """
     Patch Rust and Flutter Connection Manager (CM) popup logic:
-      1. Force allow_hide_cm to evaluate to true on open-source builds.
-      2. Remove the multi-second popup delay in Flutter cm_page.dart and hide the CM window immediately.
+      1. Force hide_cm() / allow_hide_cm() in libs/hbb_common/src/password_security.rs and src/ to return true.
+      2. Replace any qualified or unqualified option2bool("allow-hide-cm", ...) call with true.
+      3. Remove the multi-second popup delay in Flutter cm_page.dart and hide the CM window immediately.
     """
     rust_candidates = []
     if (root / "src").exists():
@@ -187,19 +188,21 @@ def patch_hide_cm_popup(root: Path) -> None:
             continue
         orig = text
 
+        # Force pub fn hide_cm() -> bool and pub fn allow_hide_cm() -> bool to return true immediately
         text = re.sub(
-            r'(pub\s+fn\s+allow_hide_cm\s*\([^)]*\)\s*->\s*bool\s*\{)',
+            r'(pub\s+fn\s+(?:allow_)?hide_cm\s*\([^)]*\)\s*->\s*bool\s*\{)',
             r'\1 return true;',
             text,
         )
+        # Match optional module prefix (e.g. crate::config::option2bool) so we don't produce crate::config::true
         if '"allow-hide-cm"' in text or 'OPTION_ALLOW_HIDE_CM' in text:
             text = re.sub(
-                r'option2bool\(\s*"allow-hide-cm"\s*,\s*&Config::get_option\(\s*"allow-hide-cm"\s*\)\s*\)',
+                r'(?:[a-zA-Z0-9_]+::)*option2bool\(\s*"allow-hide-cm"\s*,\s*&(?:[a-zA-Z0-9_]+::)*Config::get_option\(\s*"allow-hide-cm"\s*\)\s*\)',
                 'true',
                 text,
             )
             text = re.sub(
-                r'option2bool\(\s*OPTION_ALLOW_HIDE_CM\s*,\s*&Config::get_option\(\s*OPTION_ALLOW_HIDE_CM\s*\)\s*\)',
+                r'(?:[a-zA-Z0-9_]+::)*option2bool\(\s*(?:[a-zA-Z0-9_]+::)*OPTION_ALLOW_HIDE_CM\s*,\s*&(?:[a-zA-Z0-9_]+::)*Config::get_option\(\s*(?:[a-zA-Z0-9_]+::)*OPTION_ALLOW_HIDE_CM\s*\)\s*\)',
                 'true',
                 text,
             )
