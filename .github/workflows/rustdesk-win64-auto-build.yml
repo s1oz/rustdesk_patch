@@ -110,6 +110,8 @@ jobs:
       FLUTTER_VERSION: ${{ needs.check-upstream.outputs.flutter_version }}
       FLUTTER_RUST_BRIDGE_VERSION: ${{ needs.check-upstream.outputs.frb_version }}
       VCPKG_COMMIT_ID: ${{ needs.check-upstream.outputs.vcpkg_commit }}
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
     steps:
@@ -167,16 +169,40 @@ jobs:
           vcpkgDirectory: C:\vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
 
-      - name: Install Windows native dependencies via vcpkg manifest
+      - name: Install Windows native dependencies via vcpkg (including ffmpeg & mfx-dispatch for hwcodec)
         shell: pwsh
         working-directory: rustdesk-src
         run: |
+          $installRoot = "$env:VCPKG_ROOT\installed"
+          # 1. 优先使用官方仓库下的 vcpkg.json (Manifest 模式) 安装全部静态依赖
           if (Test-Path "vcpkg.json") {
-            & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --x-install-root="$env:VCPKG_ROOT\installed"
-          } else {
-            & "$env:VCPKG_ROOT\vcpkg.exe" install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
+            Write-Host "Installing dependencies from rustdesk-src/vcpkg.json..."
+            & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --x-install-root="$installRoot"
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg manifest install failed" }
           }
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+
+          # 2. 校验 hwcodec 硬件编解码必需的 ffmpeg (libavutil/pixfmt.h) 与 mfx-dispatch (libmfx.lib) 是否已就位
+          $pixfmtHeader = Join-Path $installRoot "x64-windows-static\include\libavutil\pixfmt.h"
+          $mfxLib = Join-Path $installRoot "x64-windows-static\lib\libmfx.lib"
+          if ((-not (Test-Path $pixfmtHeader)) -or (-not (Test-Path $mfxLib))) {
+            Write-Host "Installing ffmpeg:x64-windows-static and mfx-dispatch:x64-windows-static in classic mode..."
+            Push-Location $env:VCPKG_ROOT
+            & "$env:VCPKG_ROOT\vcpkg.exe" install `
+              libvpx:x64-windows-static `
+              libyuv:x64-windows-static `
+              opus:x64-windows-static `
+              aom:x64-windows-static `
+              ffmpeg:x64-windows-static `
+              mfx-dispatch:x64-windows-static `
+              --x-install-root="$installRoot"
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg classic install failed" }
+            Pop-Location
+          }
+
+          if (-not (Test-Path $pixfmtHeader)) {
+            throw "ERROR: $pixfmtHeader is still missing after vcpkg install!"
+          }
+          Write-Host "Verified hwcodec headers & static libs at: $pixfmtHeader"
 
       - name: Setup LLVM (for bindgen & flutter_rust_bridge)
         shell: pwsh
