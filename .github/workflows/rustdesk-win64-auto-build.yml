@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '指定要编译的官方版本号（例如 1.4.9，留空则自动拉取官方最新 Release）'
+        description: '指定要编译的官方版本号（例如 1.4.9 或 1.5.0，留空则自动拉取官方最新 Release）'
         required: false
         default: ''
       force_build:
@@ -50,7 +50,7 @@ jobs:
             TARGET_VER="${INPUT_VERSION#v}"
             echo "手动指定编译版本: $TARGET_VER"
           else
-            # 从官方 rustdesk/rustdesk 获取最新正式版 tag_name (例如 1.4.9)
+            # 从官方 rustdesk/rustdesk 获取最新正式版 tag_name
             TARGET_VER=$(gh api repos/rustdesk/rustdesk/releases/latest --jq '.tag_name')
             TARGET_VER="${TARGET_VER#v}"
             echo "检测到官方最新 Release 版本: $TARGET_VER"
@@ -72,7 +72,7 @@ jobs:
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Extract exact toolchain versions from upstream flutter-build.yml
+      - name: Extract exact toolchain versions from upstream workflow
         id: upstream_env
         if: steps.check.outputs.should_build == 'true'
         env:
@@ -81,12 +81,12 @@ jobs:
         run: |
           set -e
           # 动态读取对应版本官方工作流中的 FLUTTER_VERSION / FLUTTER_RUST_BRIDGE_VERSION / VCPKG_COMMIT_ID
-          # 确保跟随官方升级时不会因为工具链版本变化而编译失败
           curl -fsSL "https://raw.githubusercontent.com/rustdesk/rustdesk/${VER}/.github/workflows/flutter-build.yml" -o upstream_build.yml
+          curl -fsSL "https://raw.githubusercontent.com/rustdesk/rustdesk/${VER}/.github/workflows/bridge.yml" -o upstream_bridge.yml 2>/dev/null || true
 
-          FLUTTER_VER=$(grep -E '^\s*FLUTTER_VERSION:' upstream_build.yml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
-          FRB_VER=$(grep -E '^\s*FLUTTER_RUST_BRIDGE_VERSION:' upstream_build.yml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
-          VCPKG_ID=$(grep -E '^\s*VCPKG_COMMIT_ID:' upstream_build.yml | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          FLUTTER_VER=$(grep -E '^\s*FLUTTER_VERSION:' upstream_build.yml upstream_bridge.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          FRB_VER=$(grep -E '^\s*FLUTTER_RUST_BRIDGE_VERSION:' upstream_build.yml upstream_bridge.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          VCPKG_ID=$(grep -E '^\s*VCPKG_COMMIT_ID:' upstream_build.yml upstream_bridge.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
 
           echo "flutter_version=${FLUTTER_VER:-3.24.5}" >> "$GITHUB_OUTPUT"
           echo "frb_version=${FRB_VER:-1.80.1}" >> "$GITHUB_OUTPUT"
@@ -107,6 +107,14 @@ jobs:
       FLUTTER_RUST_BRIDGE_VERSION: ${{ needs.check-upstream.outputs.frb_version }}
       VCPKG_COMMIT_ID: ${{ needs.check-upstream.outputs.vcpkg_commit }}
     steps:
+      - name: Export GitHub Actions cache environment variables (for vcpkg x-gha)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+
       - name: Checkout current repository (for patch_rustdesk.py)
         uses: actions/checkout@v4
         with:
@@ -117,7 +125,7 @@ jobs:
         run: |
           git clone --branch "${{ env.VERSION }}" --depth 1 --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
 
-      - name: Apply custom patch (Hide CM Popup & Redirect Auto-Update URL)
+      - name: Sanitize & Apply custom patch (Hide CM Popup & Redirect Auto-Update URL)
         shell: pwsh
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -127,18 +135,29 @@ jobs:
           API_SERVER: ${{ secrets.API_SERVER }}
           RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
         run: |
-          python .\custom-scripts\patch_rustdesk.py --root .\rustdesk-src --repo "${{ github.repository }}"
+          # 自动清理复制粘贴时可能误带的 ```python 或 ``` Markdown 代码块标记
+          $patchPath = ".\custom-scripts\patch_rustdesk.py"
+          if (Test-Path $patchPath) {
+            $cleaned = Get-Content $patchPath -Encoding UTF8 | Where-Object { $_ -notmatch '^\s*```' }
+            $cleaned | Set-Content $patchPath -Encoding UTF8
+          }
+          python $patchPath --root .\rustdesk-src --repo "${{ github.repository }}"
 
-      - name: Setup vcpkg with GitHub Actions cache
+      - name: Setup vcpkg with GitHub Actions binary cache
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: ${{ runner.workspace }}/vcpkg
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
 
-      - name: Install Windows native dependencies via vcpkg
+      - name: Install Windows native dependencies via vcpkg manifest
         shell: pwsh
+        working-directory: rustdesk-src
         run: |
-          & "$env:VCPKG_ROOT\vcpkg.exe" install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
+          if (Test-Path "vcpkg.json") {
+            & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --x-install-root="$env:VCPKG_ROOT\installed"
+          } else {
+            & "$env:VCPKG_ROOT\vcpkg.exe" install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
+          }
 
       - name: Setup LLVM (for bindgen & flutter_rust_bridge)
         shell: pwsh
@@ -173,24 +192,23 @@ jobs:
           cd ..
           flutter_rust_bridge_codegen --rust-input .\src\flutter_ffi.rs --dart-output .\flutter\lib\generated_bridge.dart
 
-      - name: Download Windows virtual display driver (usbmmidd_v2)
-        shell: pwsh
-        working-directory: rustdesk-src
-        run: |
-          New-Item -ItemType Directory -Force -Path "flutter\build\windows\x64\runner\Release" | Out-Null
-          Invoke-WebRequest -Uri "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip" -OutFile "usbmmidd_v2.zip"
-          Expand-Archive -Path "usbmmidd_v2.zip" -DestinationPath "flutter\build\windows\x64\runner\Release" -Force
-          Remove-Item "usbmmidd_v2.zip" -Force
-
-      - name: Build & Pack RustDesk Windows x64 Portable Installer (.exe)
+      - name: Build RustDesk Windows x64 & Bundle Virtual Display Driver
         shell: pwsh
         working-directory: rustdesk-src
         run: |
           pip install -r libs/portable/requirements.txt
-          # 执行官方 build.py：自动编译 virtual_display、librustdesk.dll、Flutter Windows 界面，并打包为单文件安装程序
-          python build.py --portable --flutter --hwcodec --vram
-          # 同时复制一份标准命名的 rustdesk-<version>-x86_64.exe，供客户端 updater.rs 自动更新匹配下载
-          Copy-Item "rustdesk-${{ env.VERSION }}-install.exe" "rustdesk-${{ env.VERSION }}-x86_64.exe"
+          # 先编译 Rust 核心库与 Flutter Windows 界面（暂不打包单文件，以便注入 usbmmidd_v2 虚拟显示器驱动）
+          python build.py --portable --flutter --hwcodec --vram --skip-portable-pack
+          # 下载并解压官方 usbmmidd_v2 虚拟显示器驱动到 Release 目录
+          Invoke-WebRequest -Uri "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip" -OutFile "usbmmidd_v2.zip"
+          Expand-Archive -Path "usbmmidd_v2.zip" -DestinationPath "flutter\build\windows\x64\runner\Release" -Force
+          Remove-Item "usbmmidd_v2.zip" -Force
+          # 打包为单文件安装程序 rustdesk-<version>-install.exe
+          cd libs/portable
+          python ./generate.py -f ../../flutter/build/windows/x64/runner/Release -o . -e ../../flutter/build/windows/x64/runner/Release/rustdesk.exe
+          cd ../..
+          Move-Item -Path "./target/release/rustdesk-portable-packer.exe" -Destination "./rustdesk-${{ env.VERSION }}-install.exe" -Force
+          Copy-Item "./rustdesk-${{ env.VERSION }}-install.exe" "./rustdesk-${{ env.VERSION }}-x86_64.exe" -Force
 
       - name: Publish to GitHub Releases (Auto-Update Endpoint)
         uses: softprops/action-gh-release@v2
