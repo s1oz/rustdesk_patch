@@ -15,7 +15,7 @@ on:
         description: '若当前仓库已存在同版本 Release，是否强制重新编译覆盖'
         type: boolean
         required: false
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -44,6 +44,7 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
           FORCE_BUILD: ${{ github.event.inputs.force_build }}
         run: |
@@ -62,11 +63,12 @@ jobs:
 
           # 检查当前仓库是否已经发布过该版本的 Release
           if gh release view "$TARGET_VER" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            if [ "$FORCE_BUILD" = "true" ]; then
-              echo "当前仓库已存在版本 $TARGET_VER，但启用了 force_build，继续编译。"
+            # 手动触发 (workflow_dispatch) 默认允许重新构建覆盖，定时任务 (schedule) 则跳过已发布的版本
+            if [ "$FORCE_BUILD" = "true" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "当前仓库已存在版本 $TARGET_VER，执行重新编译并覆盖 Release 产物。"
               echo "should_build=true" >> "$GITHUB_OUTPUT"
             else
-              echo "当前仓库已存在版本 $TARGET_VER 的 Release，跳过本次构建。"
+              echo "当前仓库已存在版本 $TARGET_VER 的 Release，跳过本次定时构建。"
               echo "should_build=false" >> "$GITHUB_OUTPUT"
             fi
           else
@@ -128,6 +130,7 @@ jobs:
         shell: pwsh
         run: |
           git clone --branch "${{ env.VERSION }}" --depth 1 --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
 
       - name: Sanitize & Apply custom patch (Hide CM Popup & Redirect Auto-Update URL)
         shell: pwsh
@@ -154,6 +157,7 @@ jobs:
             Set-Content -Path $patchPath -Value $raw -Encoding UTF8
           }
           python -X utf8 $patchPath --root .\rustdesk-src --repo "${{ github.repository }}"
+          if ($LASTEXITCODE -ne 0) { throw "patch_rustdesk.py failed" }
 
       - name: Setup vcpkg with GitHub Actions binary cache
         uses: lukka/run-vcpkg@v11
@@ -170,11 +174,11 @@ jobs:
           } else {
             & "$env:VCPKG_ROOT\vcpkg.exe" install libvpx:x64-windows-static libyuv:x64-windows-static opus:x64-windows-static aom:x64-windows-static
           }
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
 
       - name: Setup LLVM (for bindgen & flutter_rust_bridge)
         shell: pwsh
         run: |
-          # windows-2022 镜像默认已预装 64位 LLVM (C:\Program Files\LLVM\bin)，直接复用；若不存在才通过 choco 安装最新版
           if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
             choco install -y llvm
           }
@@ -198,34 +202,99 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Generate Flutter-Rust Bridge (FFI)
+      - name: Replace engine with RustDesk custom Flutter engine (Windows x64)
         shell: pwsh
         working-directory: rustdesk-src
         run: |
           flutter config --enable-windows-desktop
-          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
-          cd flutter
-          flutter pub get
-          cd ..
-          flutter_rust_bridge_codegen --rust-input .\src\flutter_ffi.rs --dart-output .\flutter\lib\generated_bridge.dart --c-output .\flutter\macos\Runner\bridge_generated.h --llvm-path "C:\Program Files\LLVM"
+          flutter doctor -v
+          flutter precache --windows
+          $flutterBin = (Get-Command flutter.bat -ErrorAction SilentlyContinue).Source
+          if (-not $flutterBin) { $flutterBin = (Get-Command flutter).Source }
+          $flutterRoot = Split-Path (Split-Path $flutterBin -Parent) -Parent
+          $engineDir = Join-Path $flutterRoot "bin\cache\artifacts\engine\windows-x64-release"
+          Write-Host "Replacing Flutter Windows x64 engine in: $engineDir"
+          Invoke-WebRequest -Uri "https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip" -OutFile "windows-x64-release.zip"
+          Expand-Archive -Path "windows-x64-release.zip" -DestinationPath $engineDir -Force
+          Remove-Item "windows-x64-release.zip" -Force
 
-      - name: Build RustDesk Windows x64 & Bundle Virtual Display Driver
+      - name: Generate Flutter-Rust Bridge (FFI)
+        shell: pwsh
+        working-directory: rustdesk-src
+        run: |
+          if (-not (Get-Command flutter_rust_bridge_codegen -ErrorAction SilentlyContinue)) {
+            cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+            if ($LASTEXITCODE -ne 0) { throw "cargo install flutter_rust_bridge_codegen failed" }
+          }
+          Push-Location flutter
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { throw "flutter pub get failed" }
+          Pop-Location
+          flutter_rust_bridge_codegen --rust-input .\src\flutter_ffi.rs --dart-output .\flutter\lib\generated_bridge.dart --llvm-path "C:\Program Files\LLVM"
+          if ($LASTEXITCODE -ne 0) { throw "flutter_rust_bridge_codegen failed" }
+          # 修复 ffigen 在 Windows 下生成的 DartPort Bool/Uint8 签名差异（与官方 build.py ffi_bindgen_function_refactor 保持一致）
+          $bridgeDart = ".\flutter\lib\generated_bridge.dart"
+          if (Test-Path $bridgeDart) {
+            (Get-Content $bridgeDart -Raw -Encoding UTF8).Replace(
+              "ffi.NativeFunction<ffi.Bool Function(DartPort",
+              "ffi.NativeFunction<ffi.Uint8 Function(DartPort"
+            ) | Set-Content $bridgeDart -Encoding UTF8
+          }
+
+      - name: Build RustDesk Windows x64 & Bundle Drivers into Single EXE
         shell: pwsh
         working-directory: rustdesk-src
         run: |
           pip install -r libs/portable/requirements.txt
-          # 先编译 Rust 核心库与 Flutter Windows 界面（暂不打包单文件，以便注入 usbmmidd_v2 虚拟显示器驱动）
+          if ($LASTEXITCODE -ne 0) { throw "pip install requirements.txt failed" }
+
+          # 1. 编译 Rust 核心库 (librustdesk.dll) 与 Flutter Windows 桌面端 (flutter\build\windows\x64\runner\Release)
           python -X utf8 build.py --portable --flutter --hwcodec --vram --skip-portable-pack
-          # 下载并解压官方 usbmmidd_v2 虚拟显示器驱动到 Release 目录
+          if ($LASTEXITCODE -ne 0) { throw "build.py compilation failed with exit code $LASTEXITCODE" }
+
+          $releaseDir = "flutter\build\windows\x64\runner\Release"
+          if (-not (Test-Path "$releaseDir\rustdesk.exe")) {
+            throw "ERROR: $releaseDir\rustdesk.exe was not generated by flutter build windows!"
+          }
+
+          # 确保 librustdesk.dll 与 dylib_virtual_display.dll 均已拷入 Release 目录
+          if ((Test-Path "target\release\librustdesk.dll") -and (-not (Test-Path "$releaseDir\librustdesk.dll"))) {
+            Copy-Item "target\release\librustdesk.dll" "$releaseDir\librustdesk.dll" -Force
+          }
+          if ((Test-Path "target\release\deps\dylib_virtual_display.dll") -and (-not (Test-Path "$releaseDir\dylib_virtual_display.dll"))) {
+            Copy-Item "target\release\deps\dylib_virtual_display.dll" "$releaseDir\dylib_virtual_display.dll" -Force
+          }
+
+          # 2. 按照官方 flutter-build.yml 规范，将 Release 目录重命名为 .\rustdesk 并注入虚拟显示器驱动
+          if (Test-Path ".\rustdesk") { Remove-Item ".\rustdesk" -Recurse -Force }
+          Move-Item -Path $releaseDir -Destination ".\rustdesk" -Force
+
           Invoke-WebRequest -Uri "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip" -OutFile "usbmmidd_v2.zip"
-          Expand-Archive -Path "usbmmidd_v2.zip" -DestinationPath "flutter\build\windows\x64\runner\Release" -Force
+          Expand-Archive -Path "usbmmidd_v2.zip" -DestinationPath ".\rustdesk" -Force
           Remove-Item "usbmmidd_v2.zip" -Force
-          # 打包为单文件安装程序 rustdesk-<version>-install.exe
-          cd libs/portable
-          python -X utf8 ./generate.py -f ../../flutter/build/windows/x64/runner/Release -o . -e ../../flutter/build/windows/x64/runner/Release/rustdesk.exe
-          cd ../..
+
+          Write-Host "=== Files inside .\rustdesk before portable packing ==="
+          Get-ChildItem ".\rustdesk" | Select-Object Name, Length | Format-Table -AutoSize
+
+          # 3. 进入 libs/portable 执行打包（注意 -f ../../rustdesk/ 末尾必须带斜杠，否则相对路径截断异常会导致只打出 <1MB 空壳）
+          Push-Location libs/portable
+          if (Test-Path "data.bin") { Remove-Item "data.bin" -Force }
+          # 强制重新编译 rustdesk-portable-packer，避免 Swatinem/rust-cache 复用旧空壳二进制
+          cargo clean -p rustdesk-portable-packer 2>$null
+          python -X utf8 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          if ($LASTEXITCODE -ne 0) { throw "generate.py portable packing failed" }
+          Pop-Location
+
           Move-Item -Path "./target/release/rustdesk-portable-packer.exe" -Destination "./rustdesk-${{ env.VERSION }}-install.exe" -Force
           Copy-Item "./rustdesk-${{ env.VERSION }}-install.exe" "./rustdesk-${{ env.VERSION }}-x86_64.exe" -Force
+
+          # 4. 校验最终生成的单文件 EXE 体积（正常包含 librustdesk.dll + flutter_windows.dll 压缩后应在 20MB 以上）
+          $exeItem = Get-Item "./rustdesk-${{ env.VERSION }}-x86_64.exe"
+          $sizeMB = [math]::Round($exeItem.Length / 1MB, 2)
+          Write-Host "Generated EXE size: $sizeMB MB ($($exeItem.Length) bytes)"
+          if ($exeItem.Length -lt 15MB) {
+            throw "ERROR: Generated EXE is abnormally small ($sizeMB MB < 15 MB)! Portable packing failed to embed Release payload."
+          }
 
       - name: Publish to GitHub Releases (Auto-Update Endpoint)
         uses: softprops/action-gh-release@v2
