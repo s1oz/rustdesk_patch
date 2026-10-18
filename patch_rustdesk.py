@@ -1,15 +1,14 @@
-### Gemini Canvas: Patch Rustdesk
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 RustDesk Windows (x86_64) Automated Patch Script (patch_rustdesk.py)
 Features:
-  1. Hide the controlled-side Connection Manager (CM) popup window immediately upon connection.
-  2. Redirect client version check and Windows auto-update URLs to your GitHub repository Releases.
-  3. Enable Windows auto-update (allow-auto-update=Y) and startup update check (enable-check-update=Y) by default.
-  4. Optionally inject custom self-hosted server settings (RENDEZVOUS_SERVER / RS_PUB_KEY / API_SERVER) if set.
+  1. Completely hide the controlled-side Connection Manager (CM) popup window (0ms, never shown on screen).
+  2. Clean/Pure UI: Remove official "self-host server tip" banner, remove "Account" & "About" tabs in Settings,
+     disable Address Book / Accessible Devices / Help Cards by default, and clear official admin API URL.
+  3. Rename displayed software name to "本地互联" across Flutter UI, Win32 window title, tray, and Chinese lang pack
+     (while keeping internal binary/updater filename compatibility).
+  4. Redirect client version check and Windows auto-update URLs to your GitHub repository Releases.
 """
 
 import argparse
@@ -34,7 +33,7 @@ def write_text(path: Path, content: str) -> None:
 
 
 def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: str, pub_key: str) -> None:
-    """Patch libs/hbb_common/src/config.rs to inject default options for hiding CM popup and enabling auto-update."""
+    """Patch libs/hbb_common/src/config.rs to inject default options for hiding CM popup, pure UI, and auto-update."""
     config_path = root / "libs" / "hbb_common" / "src" / "config.rs"
     if not config_path.exists():
         print(f"[WARN] File not found: {config_path} (ensure git submodule libs/hbb_common is initialized)", file=sys.stderr)
@@ -77,6 +76,11 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
         '            ("allow-auto-update", "Y"),',
         '            ("enable-udp-punch", "Y"),',
         '            ("enable-ipv6-punch", "Y"),',
+        '            ("disable-ab", "Y"),',
+        '            ("disable-account", "Y"),',
+        '            ("disable-group-panel", "Y"),',
+        '            ("hide-help-cards", "Y"),',
+        '            ("remove-preset-password-warning", "Y"),',
     ]
     if id_server:
         config2_inject_lines.append(f'            ("custom-rendezvous-server", "{id_server}"),')
@@ -110,12 +114,12 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
                 content,
                 count=1,
             )
-            print("[INFO] config.rs: Injected allow-hide-cm=Y and allow-auto-update=Y into Config2::load() (simple form)")
+            print("[INFO] config.rs: Injected default options into Config2::load() (simple form)")
         else:
             pattern_mut = re.compile(r'(let\s+mut\s+config\s*=\s*Config::load_::<Config2>\("2"\);)')
             if pattern_mut.search(content):
                 content = pattern_mut.sub(r'\1' + "\n" + config2_inject_block, content, count=1)
-                print("[INFO] config.rs: Injected allow-hide-cm=Y and allow-auto-update=Y into Config2::load() (mut form)")
+                print("[INFO] config.rs: Injected default options into Config2::load() (mut form)")
 
     # 3. Inject default options into LocalConfig::load()
     local_inject_block = "\n".join([
@@ -126,6 +130,7 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
         '            ("enable-check-update", "Y"),',
         '            ("allow-auto-update", "Y"),',
         '            ("show-scam-warning", "N"),',
+        '            ("hide-help-cards", "Y"),',
         '        ] {',
         '            if !config.options.contains_key(k) {',
         '                config.options.insert(k.to_string(), v.to_string());',
@@ -158,11 +163,11 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
     if "DEFAULT_SETTINGS" in content and '"allow-hide-cm"' not in content:
         content = re.sub(
             r'(const\s+DEFAULT_SETTINGS\s*:\s*&\[\(&str,\s*&str\)\]\s*=\s*&\[)',
-            r'\1' + '\n    ("allow-hide-cm", "Y"),\n    ("allow-auto-update", "Y"),',
+            r'\1' + '\n    ("allow-hide-cm", "Y"),\n    ("allow-auto-update", "Y"),\n    ("disable-ab", "Y"),\n    ("disable-account", "Y"),\n    ("disable-group-panel", "Y"),\n    ("hide-help-cards", "Y"),',
             content,
             count=1,
         )
-        print("[INFO] config.rs: Injected allow-hide-cm=Y and allow-auto-update=Y into DEFAULT_SETTINGS")
+        print("[INFO] config.rs: Injected options into DEFAULT_SETTINGS")
 
     if content != original:
         write_text(config_path, content)
@@ -170,10 +175,11 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
 
 def patch_hide_cm_popup(root: Path) -> None:
     """
-    Patch Rust and Flutter Connection Manager (CM) popup logic:
-      1. Force hide_cm() / allow_hide_cm() in libs/hbb_common/src/password_security.rs and src/ to return true.
-      2. Replace any qualified or unqualified option2bool("allow-hide-cm", ...) call with true.
-      3. Remove the multi-second popup delay in Flutter cm_page.dart and hide the CM window immediately.
+    Completely hide the Connection Manager (--cm) popup window on the controlled computer:
+      1. Force hide_cm() / allow_hide_cm() in Rust (password_security.rs, cm_interface.rs) to always return true.
+      2. Patch Flutter server_page.dart, server_model.dart, and cm_page.dart (the actual CM window files!)
+         to replace windowManager.show() / focus() with windowManager.hide() and zero out any popup timers.
+      3. Patch runConnectionManagerScreen in flutter/lib/main.dart so the --cm window starts hidden.
     """
     rust_candidates = []
     if (root / "src").exists():
@@ -194,7 +200,7 @@ def patch_hide_cm_popup(root: Path) -> None:
             r'\1 #[allow(unreachable_code)] return true;',
             text,
         )
-        # Match optional module prefix (e.g. crate::config::option2bool) so we don't produce crate::config::true
+        # Match optional module prefix (e.g. crate::config::option2bool)
         if '"allow-hide-cm"' in text or 'OPTION_ALLOW_HIDE_CM' in text:
             text = re.sub(
                 r'(?:[a-zA-Z0-9_]+::)*option2bool\(\s*"allow-hide-cm"\s*,\s*&(?:[a-zA-Z0-9_]+::)*Config::get_option\(\s*"allow-hide-cm"\s*\)\s*\)',
@@ -215,8 +221,12 @@ def patch_hide_cm_popup(root: Path) -> None:
     if not flutter_dir.exists():
         return
 
+    # Target the actual Connection Manager files in Flutter:
+    # server_page.dart, server_model.dart, cm_page.dart, and main.dart
+    cm_target_files = {"server_page.dart", "server_model.dart", "cm_page.dart"}
     for dart_file in flutter_dir.rglob("*.dart"):
-        if "cm" not in dart_file.name.lower() and "main" not in dart_file.name.lower():
+        fname = dart_file.name
+        if fname not in cm_target_files and fname != "main.dart":
             continue
         try:
             text = read_text(dart_file)
@@ -224,27 +234,180 @@ def patch_hide_cm_popup(root: Path) -> None:
             continue
         orig = text
 
-        if "windowManager.hide" in text or "hide_cm" in text or "hideCm" in text:
+        if fname in cm_target_files:
+            # Zero out any multi-second delay timers (e.g. Duration(seconds: 3) -> Duration(milliseconds: 0))
             text = re.sub(
                 r'Duration\(\s*seconds\s*:\s*[1-9]\d*\s*\)',
                 'Duration(milliseconds: 0)',
                 text,
             )
-            if dart_file.name == "cm_page.dart":
-                text = re.sub(
-                    r'windowManager\.show\(\)\s*;',
-                    'windowManager.hide();',
-                    text,
-                )
-                text = re.sub(
-                    r'windowManager\.focus\(\)\s*;',
-                    'windowManager.hide();',
-                    text,
-                )
+            # Replace windowManager.show() and windowManager.focus() with windowManager.hide()
+            text = re.sub(
+                r'windowManager\.show\s*\(\s*\)',
+                'windowManager.hide()',
+                text,
+            )
+            text = re.sub(
+                r'windowManager\.focus\s*\(\s*\)',
+                'windowManager.hide()',
+                text,
+            )
+            # Force _hideCm default state to true if present
+            text = re.sub(
+                r'bool\s+_hideCm\s*=\s*false\s*;',
+                'bool _hideCm = true;',
+                text,
+            )
+            text = re.sub(
+                r"bind\.cmGetConfig\(\s*name\s*:\s*['\"]hide_cm['\"]\s*\)\s*==\s*['\"]true['\"]",
+                'true',
+                text,
+            )
+        elif fname == "main.dart":
+            # In main.dart, only replace windowManager.show() inside runConnectionManagerScreen
+            if "runConnectionManagerScreen" in text:
+                parts = text.split("runConnectionManagerScreen")
+                # Patch the segment belonging to runConnectionManagerScreen (up to the next top-level void run...)
+                sub = parts[1]
+                next_run = re.search(r'\nvoid\s+run[A-Z]\w*\s*\(', sub)
+                if next_run:
+                    cm_block = sub[:next_run.start()]
+                    rest_block = sub[next_run.start():]
+                else:
+                    cm_block = sub
+                    rest_block = ""
+                cm_block = re.sub(r'windowManager\.show\s*\(\s*\)', 'windowManager.hide()', cm_block)
+                cm_block = re.sub(r'windowManager\.focus\s*\(\s*\)', 'windowManager.hide()', cm_block)
+                cm_block = re.sub(r'Duration\(\s*seconds\s*:\s*[1-9]\d*\s*\)', 'Duration(milliseconds: 0)', cm_block)
+                text = parts[0] + "runConnectionManagerScreen" + cm_block + rest_block
 
         if text != orig:
             write_text(dart_file, text)
             print(f"[INFO] Hide CM Popup (Flutter): Patched {dart_file.relative_to(root)}")
+
+
+def patch_clean_ui(root: Path, api_server: str) -> None:
+    """
+    Pure / De-branded UI customization:
+      1. Hide the bottom "If you need faster connection speed, you can choose to self-host server" banner
+         in flutter/lib/desktop/pages/connection_page.dart.
+      2. Remove "Account" and "About" tabs from Settings in flutter/lib/desktop/pages/desktop_setting_page.dart.
+      3. Clear official https://admin.rustdesk.com API URL in src/common.rs if no custom API_SERVER is set.
+    """
+    # 1. Hide bottom setup_server_tip banner in connection_page.dart
+    conn_page = root / "flutter" / "lib" / "desktop" / "pages" / "connection_page.dart"
+    if conn_page.exists():
+        text = read_text(conn_page)
+        orig = text
+        # Make setupServerWidget always offstage (hidden) without breaking widget tree parentheses
+        text = text.replace("_svcIsUsingPublicServer.value", "false")
+        text = text.replace("translate('setup_server_tip')", "''")
+        if text != orig:
+            write_text(conn_page, text)
+            print("[INFO] Clean UI: Hidden bottom self-host server tip banner in connection_page.dart")
+
+    # 2. Remove Account & About tabs in desktop_setting_page.dart
+    setting_page = root / "flutter" / "lib" / "desktop" / "pages" / "desktop_setting_page.dart"
+    if setting_page.exists():
+        text = read_text(setting_page)
+        orig = text
+        text = re.sub(
+            r'if\s*\(\s*!bind\.isDisableAccount\(\)\s*\)\s*SettingsTabKey\.account\s*,',
+            '// SettingsTabKey.account removed',
+            text,
+        )
+        text = re.sub(
+            r'(?m)^\s*SettingsTabKey\.about\s*,',
+            '    // SettingsTabKey.about removed',
+            text,
+        )
+        if text != orig:
+            write_text(setting_page, text)
+            print("[INFO] Clean UI: Removed 'Account' and 'About' tabs in desktop_setting_page.dart")
+
+    # 3. Clear official https://admin.rustdesk.com in src/common.rs when no custom api_server is provided
+    common_rs = root / "src" / "common.rs"
+    if common_rs.exists() and not api_server:
+        text = read_text(common_rs)
+        orig = text
+        text = text.replace('"https://admin.rustdesk.com"', '""')
+        if text != orig:
+            write_text(common_rs, text)
+            print("[INFO] Clean UI: Cleared official https://admin.rustdesk.com in src/common.rs")
+
+
+def patch_app_name(root: Path, app_name: str) -> None:
+    """
+    Rename displayed software name (e.g. '本地互联') across Flutter UI, Win32 window title, tray, and lang files,
+    while keeping internal binary/service/updater identifier 'RustDesk' intact so portable packing & auto-update work.
+    """
+    if not app_name:
+        return
+
+    # 1. Patch main_get_app_name() in src/flutter_ffi.rs so Flutter UI & window titlebar display app_name
+    ffi_rs = root / "src" / "flutter_ffi.rs"
+    if ffi_rs.exists():
+        text = read_text(ffi_rs)
+        orig = text
+        text, n = re.subn(
+            r'(pub\s+fn\s+main_get_app_name\s*\([^)]*\)\s*->\s*SyncReturn<String>\s*\{)[\s\S]*?(\n\})',
+            rf'\1\n    SyncReturn("{app_name}".to_owned())\2',
+            text,
+            count=1,
+        )
+        if text != orig:
+            write_text(ffi_rs, text)
+            print(f"[INFO] App Name: Patched main_get_app_name() in src/flutter_ffi.rs -> {app_name} (matched {n})")
+
+    # 2. Patch Win32 initial window title in flutter/windows/runner/main.cpp using UTF-16 escape sequences
+    main_cpp = root / "flutter" / "windows" / "runner" / "main.cpp"
+    if main_cpp.exists():
+        text = read_text(main_cpp)
+        orig = text
+        utf16_escaped = "".join(f"\\u{ord(c):04x}" if ord(c) > 127 else c for c in app_name)
+        text = text.replace('L"RustDesk"', f'L"{utf16_escaped}"')
+        if text != orig:
+            write_text(main_cpp, text)
+            print(f"[INFO] App Name: Patched Win32 window title in flutter/windows/runner/main.cpp -> {app_name}")
+
+    # 3. Patch system tray tooltip in src/tray.rs
+    tray_rs = root / "src" / "tray.rs"
+    if tray_rs.exists():
+        text = read_text(tray_rs)
+        orig = text
+        text = text.replace("crate::get_app_name()", f'"{app_name}"')
+        if text != orig:
+            write_text(tray_rs, text)
+            print(f"[INFO] App Name: Patched tray tooltip in src/tray.rs -> {app_name}")
+
+    # 4. Patch Chinese localization files (src/lang/cn.rs, src/lang/tw.rs) to replace "RustDesk" with app_name in values
+    for lang_file in [root / "src" / "lang" / "cn.rs", root / "src" / "lang" / "tw.rs"]:
+        if not lang_file.exists():
+            continue
+        text = read_text(lang_file)
+        orig = text
+
+        # Clear setup_server_tip text
+        text = re.sub(
+            r'\(\s*"setup_server_tip"\s*,\s*"[^"]*"\s*\)',
+            '("setup_server_tip", "")',
+            text,
+        )
+        # Replace "RustDesk" with app_name only in the second element (translation value) of tuple ("key", "value")
+        def replace_val(match: re.Match) -> str:
+            prefix = match.group(1)
+            val = match.group(2).replace("RustDesk", app_name)
+            suffix = match.group(3)
+            return f"{prefix}{val}{suffix}"
+
+        text = re.sub(
+            r'(\(\s*"[^"]*"\s*,\s*")([^"]*RustDesk[^"]*)("\s*\))',
+            replace_val,
+            text,
+        )
+        if text != orig:
+            write_text(lang_file, text)
+            print(f"[INFO] App Name & Clean UI: Replaced 'RustDesk' -> '{app_name}' in {lang_file.relative_to(root)}")
 
 
 def patch_update_urls(root: Path, target_repo: str, api_server: str) -> None:
@@ -305,9 +468,10 @@ def patch_update_urls(root: Path, target_repo: str, api_server: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Patch RustDesk source for silent CM popup & custom GitHub Release auto-update.")
+    parser = argparse.ArgumentParser(description="Patch RustDesk source for silent CM popup, pure UI, custom app name & GitHub Release auto-update.")
     parser.add_argument("--root", default=".", help="RustDesk source root directory")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""), help="Target GitHub repository (owner/repo)")
+    parser.add_argument("--app-name", default=os.environ.get("CUSTOM_APP_NAME", "本地互联"), help="Custom displayed software name (default: 本地互联)")
     parser.add_argument("--id-server", default=os.environ.get("RENDEZVOUS_SERVER", ""), help="Optional custom ID server (hbbs)")
     parser.add_argument("--relay-server", default=os.environ.get("RELAY_SERVER", ""), help="Optional custom relay server (hbbr)")
     parser.add_argument("--api-server", default=os.environ.get("API_SERVER", ""), help="Optional custom API server")
@@ -320,7 +484,7 @@ def main() -> None:
         print("[ERROR] Please specify --repo owner/repo or set GITHUB_REPOSITORY environment variable!", file=sys.stderr)
         sys.exit(1)
 
-    print(f"=== Starting RustDesk Custom Patch (Target Repo: {args.repo}) ===")
+    print(f"=== Starting RustDesk Custom Patch (Target Repo: {args.repo}, App Name: {args.app_name}) ===")
     patch_config_rs(
         root=root,
         id_server=args.id_server.strip(),
@@ -329,10 +493,11 @@ def main() -> None:
         pub_key=args.pub_key.strip(),
     )
     patch_hide_cm_popup(root=root)
+    patch_clean_ui(root=root, api_server=args.api_server.strip())
+    patch_app_name(root=root, app_name=args.app_name.strip())
     patch_update_urls(root=root, target_repo=args.repo.strip(), api_server=args.api_server.strip())
     print("=== RustDesk Custom Patch Completed Successfully ===")
 
 
 if __name__ == "__main__":
     main()
-```
