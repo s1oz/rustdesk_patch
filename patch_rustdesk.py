@@ -179,7 +179,7 @@ def patch_hide_cm_popup(root: Path) -> None:
       1. Force hide_cm() / allow_hide_cm() in Rust (password_security.rs, cm_interface.rs) to always return true.
       2. Patch Flutter server_page.dart, server_model.dart, and cm_page.dart (the actual CM window files!)
          to replace windowManager.show() / focus() with windowManager.hide() and zero out any popup timers.
-      3. Patch runConnectionManagerScreen in flutter/lib/main.dart so the --cm window starts hidden.
+      3. Patch runConnectionManagerScreen in flutter/lib/main.dart using regex (without splitting/truncating the file).
     """
     rust_candidates = []
     if (root / "src").exists():
@@ -264,22 +264,19 @@ def patch_hide_cm_popup(root: Path) -> None:
                 text,
             )
         elif fname == "main.dart":
-            # In main.dart, only replace windowManager.show() inside runConnectionManagerScreen
-            if "runConnectionManagerScreen" in text:
-                parts = text.split("runConnectionManagerScreen")
-                # Patch the segment belonging to runConnectionManagerScreen (up to the next top-level void run...)
-                sub = parts[1]
-                next_run = re.search(r'\nvoid\s+run[A-Z]\w*\s*\(', sub)
-                if next_run:
-                    cm_block = sub[:next_run.start()]
-                    rest_block = sub[next_run.start():]
-                else:
-                    cm_block = sub
-                    rest_block = ""
-                cm_block = re.sub(r'windowManager\.show\s*\(\s*\)', 'windowManager.hide()', cm_block)
-                cm_block = re.sub(r'windowManager\.focus\s*\(\s*\)', 'windowManager.hide()', cm_block)
-                cm_block = re.sub(r'Duration\(\s*seconds\s*:\s*[1-9]\d*\s*\)', 'Duration(milliseconds: 0)', cm_block)
-                text = parts[0] + "runConnectionManagerScreen" + cm_block + rest_block
+            # Safely patch ONLY inside the function definition `void runConnectionManagerScreen(...) { ... }`
+            def patch_cm_screen_fn(match: re.Match) -> str:
+                body = match.group(0)
+                body = re.sub(r'windowManager\.show\s*\(\s*\)', 'windowManager.hide()', body)
+                body = re.sub(r'windowManager\.focus\s*\(\s*\)', 'windowManager.hide()', body)
+                body = re.sub(r'Duration\(\s*seconds\s*:\s*[1-9]\d*\s*\)', 'Duration(milliseconds: 0)', body)
+                return body
+
+            text = re.sub(
+                r'(?m)^(?:Future<void>|void)\s+runConnectionManagerScreen\b[\s\S]*?^\}',
+                patch_cm_screen_fn,
+                text,
+            )
 
         if text != orig:
             write_text(dart_file, text)
@@ -290,7 +287,8 @@ def patch_clean_ui(root: Path, api_server: str) -> None:
     """
     Pure / De-branded UI customization:
       1. Hide the bottom "If you need faster connection speed, you can choose to self-host server" banner
-         in flutter/lib/desktop/pages/connection_page.dart.
+         in flutter/lib/desktop/pages/connection_page.dart (only inside boolean `&& _svcIsUsingPublicServer.value`
+         check, never on left-hand side of `=`).
       2. Remove "Account" and "About" tabs from Settings in flutter/lib/desktop/pages/desktop_setting_page.dart.
       3. Clear official https://admin.rustdesk.com API URL in src/common.rs if no custom API_SERVER is set.
     """
@@ -299,8 +297,12 @@ def patch_clean_ui(root: Path, api_server: str) -> None:
     if conn_page.exists():
         text = read_text(conn_page)
         orig = text
-        # Make setupServerWidget always offstage (hidden) without breaking widget tree parentheses
-        text = text.replace("_svcIsUsingPublicServer.value", "false")
+        # Only replace `_svcIsUsingPublicServer.value` when preceded by `&&` and NOT followed by `=`
+        text = re.sub(
+            r'&&\s*_svcIsUsingPublicServer\.value\b(?!\s*=)',
+            '&& false',
+            text,
+        )
         text = text.replace("translate('setup_server_tip')", "''")
         if text != orig:
             write_text(conn_page, text)
