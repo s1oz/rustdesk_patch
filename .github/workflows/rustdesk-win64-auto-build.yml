@@ -11,6 +11,10 @@ on:
         description: '指定要编译的官方版本号（例如 1.4.9 或 1.5.0，留空则自动拉取官方最新 Release）'
         required: false
         default: ''
+      app_name:
+        description: '自定义软件显示名称（默认：本地互联）'
+        required: false
+        default: '本地互联'
       force_build:
         description: '若当前仓库已存在同版本 Release，是否强制重新编译覆盖'
         type: boolean
@@ -112,6 +116,7 @@ jobs:
       VCPKG_COMMIT_ID: ${{ needs.check-upstream.outputs.vcpkg_commit }}
       VCPKG_DEFAULT_TRIPLET: x64-windows-static
       VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+      CUSTOM_APP_NAME: ${{ github.event.inputs.app_name || '本地互联' }}
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
     steps:
@@ -134,7 +139,7 @@ jobs:
           git clone --branch "${{ env.VERSION }}" --depth 1 --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
           if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
 
-      - name: Sanitize & Apply custom patch (Hide CM Popup & Redirect Auto-Update URL)
+      - name: Sanitize & Apply custom patch (Hide CM Popup, Pure UI, App Name & Auto-Update URL)
         shell: pwsh
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -149,18 +154,15 @@ jobs:
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $patchPath = ".\custom-scripts\patch_rustdesk.py"
           if (Test-Path $patchPath) {
-            # 1. 自动清理误带的 ``` Markdown 代码块标记与重复粘贴内容
+            # 自动清理误带的 ``` Markdown 代码块标记与重复粘贴内容
             $raw = Get-Content $patchPath -Raw -Encoding UTF8
             $raw = $raw -replace '(?m)^\s*```.*$', ''
             if ($raw -match 'main\(\)\s*#!/usr/bin/env python3') {
               $raw = ($raw -split 'main\(\)\s*#!/usr/bin/env python3')[0] + "main()`n"
             }
-            # 2. 自动升级旧版 patch_rustdesk.py 中的 option2bool 正则，防止把 crate::config::option2bool 替换成 crate::config::true
-            $raw = $raw.Replace("r'option2bool\(", "r'(?:[a-zA-Z0-9_]+::)*option2bool\(")
-            $raw = $raw.Replace("r'(pub\s+fn\s+allow_hide_cm", "r'(pub\s+fn\s+(?:allow_)?hide_cm")
             Set-Content -Path $patchPath -Value $raw -Encoding UTF8
           }
-          python -X utf8 $patchPath --root .\rustdesk-src --repo "${{ github.repository }}"
+          python -X utf8 $patchPath --root .\rustdesk-src --repo "${{ github.repository }}" --app-name "${{ env.CUSTOM_APP_NAME }}"
           if ($LASTEXITCODE -ne 0) { throw "patch_rustdesk.py failed" }
 
       - name: Setup vcpkg with GitHub Actions binary cache
@@ -328,10 +330,12 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION }}
-          name: "RustDesk ${{ env.VERSION }} (Custom Windows x64)"
+          name: "${{ env.CUSTOM_APP_NAME }} ${{ env.VERSION }} (Windows x64)"
           body: |
-            基于官方 RustDesk `${{ env.VERSION }}` 自动同步编译的 Windows 64位 (x86_64) 客户端：
-            - **静默被控**：已移除/隐藏被控端连接管理弹窗（CM 窗口）
+            基于官方 RustDesk `${{ env.VERSION }}` 自动同步编译的 **${{ env.CUSTOM_APP_NAME }}** Windows 64位 (x86_64) 纯净版客户端：
+            - **软件名称**：`${{ env.CUSTOM_APP_NAME }}`
+            - **无感被控**：彻底隐藏被控端连接管理弹窗（0ms 不显示）
+            - **纯净去痕**：已移除底部自建服务器提示条、设置中的“账户/关于”页及多余面板
             - **自动更新**：已将客户端检查更新与自动更新地址指向 `${{ github.repository }}`
           draft: false
           prerelease: false
