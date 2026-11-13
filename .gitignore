@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.jks
+*.jks.b64
+*.p12
+*.keystore
+*.env
+*seed*.b64
+.secrets/

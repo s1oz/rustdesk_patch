@@ -1,0 +1,1090 @@
+name: Auto Sync & Build 本地互联 (Windows + Android)
+
+on:
+  # 1. 每天北京时间 08:00 (UTC 00:00) 自动检查上游官方是否发布了新版本，若有则自动编译发布
+  schedule:
+    - cron: '0 0 * * *'
+  # 2. 支持在 GitHub Actions 页面手动点击 "Run workflow" 立即触发编译
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '指定要编译的官方版本号（例如 1.4.9 或 1.5.0，留空则自动拉取官方最新 Release）'
+        required: false
+        default: ''
+      app_name:
+        description: '自定义软件显示名称（默认：本地互联）'
+        required: false
+        default: '本地互联'
+      force_build:
+        description: '若当前仓库已存在同版本 Release，是否强制重新编译覆盖'
+        type: boolean
+        required: false
+        default: true
+      application_id:
+        description: 'Android applicationId（默认 com.s1oz.bendihulian，必须不同于官方 com.carriez.flutter_hbb）'
+        required: false
+        default: 'com.s1oz.bendihulian'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
+jobs:
+  # ============================================================================
+  # 阶段 1：检查官方最新 Release 版本，判断是否需要触发编译
+  # ============================================================================
+  check-upstream:
+    name: Check Upstream Release
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.check.outputs.version }}
+      flutter_version: ${{ steps.upstream_env.outputs.flutter_version }}
+      frb_version: ${{ steps.upstream_env.outputs.frb_version }}
+      vcpkg_commit: ${{ steps.upstream_env.outputs.vcpkg_commit }}
+      rust_version: ${{ steps.upstream_env.outputs.rust_version }}
+      ndk_version: ${{ steps.upstream_env.outputs.ndk_version }}
+      cargo_ndk_version: ${{ steps.upstream_env.outputs.cargo_ndk_version }}
+    steps:
+      - name: Check official rustdesk/rustdesk latest release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build }}
+        run: |
+          set -e
+          if [ -n "$INPUT_VERSION" ]; then
+            TARGET_VER="${INPUT_VERSION#v}"
+            echo "手动指定编译版本: $TARGET_VER"
+          else
+            # 从官方 rustdesk/rustdesk 获取最新正式版 tag_name
+            TARGET_VER=$(gh api repos/rustdesk/rustdesk/releases/latest --jq '.tag_name')
+            TARGET_VER="${TARGET_VER#v}"
+            echo "检测到官方最新 Release 版本: $TARGET_VER"
+          fi
+
+          echo "version=$TARGET_VER" >> "$GITHUB_OUTPUT"
+
+          # 检查当前仓库是否已经发布过该版本的 Release
+          if gh release view "$TARGET_VER" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            # 手动触发 (workflow_dispatch) 默认允许重新构建覆盖，定时任务 (schedule) 则跳过已发布的版本
+            if [ "$FORCE_BUILD" = "true" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "当前仓库已存在版本 $TARGET_VER，执行重新编译并覆盖 Release 产物。"
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "当前仓库已存在版本 $TARGET_VER 的 Release，跳过本次定时构建。"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "当前仓库尚未发布版本 $TARGET_VER，开始触发自动构建。"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract exact toolchain versions from upstream workflow
+        id: upstream_env
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.check.outputs.version }}
+        run: |
+          set -e
+          # 动态读取对应版本官方工作流中的 FLUTTER_VERSION / FLUTTER_RUST_BRIDGE_VERSION / VCPKG_COMMIT_ID
+          curl -fsSL "https://raw.githubusercontent.com/rustdesk/rustdesk/${VER}/.github/workflows/flutter-build.yml" -o upstream_build.yml
+          curl -fsSL "https://raw.githubusercontent.com/rustdesk/rustdesk/${VER}/.github/workflows/bridge.yml" -o upstream_bridge.yml 2>/dev/null || true
+
+          FLUTTER_VER=$(grep -E '^\s*FLUTTER_VERSION:' upstream_build.yml upstream_bridge.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          FRB_VER=$(grep -E '^\s*FLUTTER_RUST_BRIDGE_VERSION:' upstream_build.yml upstream_bridge.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          VCPKG_ID=$(grep -E '^\s*VCPKG_COMMIT_ID:' upstream_build.yml upstream_bridge.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+
+          RUST_VER=$(grep -E '^[[:space:]]*RUST_VERSION:' upstream_build.yml upstream_bridge.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          NDK_VER=$(grep -E '^[[:space:]]*NDK_VERSION:' upstream_build.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          CARGO_NDK_VER=$(grep -E '^[[:space:]]*CARGO_NDK_VERSION:' upstream_build.yml 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+
+          echo "flutter_version=${FLUTTER_VER:-3.24.5}" >> "$GITHUB_OUTPUT"
+          echo "frb_version=${FRB_VER:-1.80.1}" >> "$GITHUB_OUTPUT"
+          echo "vcpkg_commit=${VCPKG_ID:-9e593bb18ea69cc5095e012465dcd675a822ed0d}" >> "$GITHUB_OUTPUT"
+          echo "rust_version=${RUST_VER:-1.75}" >> "$GITHUB_OUTPUT"
+          echo "ndk_version=${NDK_VER:-r28c}" >> "$GITHUB_OUTPUT"
+          echo "cargo_ndk_version=${CARGO_NDK_VER:-3.1.2}" >> "$GITHUB_OUTPUT"
+          echo "解析官方工具链版本: Flutter=${FLUTTER_VER:-3.24.5}, FRB=${FRB_VER:-1.80.1}, VCPKG=${VCPKG_ID}, Rust=${RUST_VER:-1.75}, NDK=${NDK_VER:-r28c}, cargo-ndk=${CARGO_NDK_VER:-3.1.2}"
+
+  # ============================================================================
+  # 阶段 2：编译打包 Windows 64位 (x86_64) 客户端并发布到当前仓库 Releases
+  # ============================================================================
+  build-windows-x64:
+    name: Build Windows x64 Client
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: windows-2022
+    env:
+      VERSION: ${{ needs.check-upstream.outputs.version }}
+      FLUTTER_VERSION: ${{ needs.check-upstream.outputs.flutter_version }}
+      FLUTTER_RUST_BRIDGE_VERSION: ${{ needs.check-upstream.outputs.frb_version }}
+      VCPKG_COMMIT_ID: ${{ needs.check-upstream.outputs.vcpkg_commit }}
+      VCPKG_DEFAULT_TRIPLET: x64-windows-static
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+      CUSTOM_APP_NAME: ${{ github.event.inputs.app_name || '本地互联' }}
+      APPLICATION_ID: ${{ github.event.inputs.application_id || 'com.s1oz.bendihulian' }}
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Export GitHub Actions cache environment variables (for vcpkg x-gha)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+
+      - name: Checkout current repository (for patch_rustdesk.py)
+        uses: actions/checkout@v4
+        with:
+          path: custom-scripts
+
+      - name: Clone official rustdesk/rustdesk at tag ${{ env.VERSION }}
+        shell: pwsh
+        run: |
+          git clone --branch "${{ env.VERSION }}" --depth 1 --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+
+      - name: Sanitize & Apply custom patch (Hide CM Popup, Pure UI, App Name & Auto-Update URL)
+        shell: pwsh
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: "utf-8"
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          # 如需可选内置自建服务器，可在仓库 Settings -> Secrets and variables -> Actions 中添加以下 Secrets：
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RELAY_SERVER: ${{ secrets.RELAY_SERVER }}
+          API_SERVER: ${{ secrets.API_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $patchPath = ".\custom-scripts\patch_rustdesk.py"
+          if (Test-Path $patchPath) {
+            # 自动清理误带的 ``` Markdown 代码块标记与重复粘贴内容
+            $raw = Get-Content $patchPath -Raw -Encoding UTF8
+            $raw = $raw -replace '(?m)^\s*```.*$', ''
+            if ($raw -match 'main\(\)\s*#!/usr/bin/env python3') {
+              $raw = ($raw -split 'main\(\)\s*#!/usr/bin/env python3')[0] + "main()`n"
+            }
+            Set-Content -Path $patchPath -Value $raw -Encoding UTF8
+          }
+          python -X utf8 $patchPath --root .\rustdesk-src --repo "${{ github.repository }}" --app-name "${{ env.CUSTOM_APP_NAME }}" --application-id "${{ env.APPLICATION_ID }}"
+          if ($LASTEXITCODE -ne 0) { throw "patch_rustdesk.py failed" }
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+
+      - name: Install Windows native dependencies via vcpkg (including ffmpeg & mfx-dispatch for hwcodec)
+        shell: pwsh
+        working-directory: rustdesk-src
+        run: |
+          $installRoot = "$env:VCPKG_ROOT\installed"
+          # 1. 优先使用官方仓库下的 vcpkg.json (Manifest 模式) 安装全部静态依赖
+          if (Test-Path "vcpkg.json") {
+            Write-Host "Installing dependencies from rustdesk-src/vcpkg.json..."
+            & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --x-install-root="$installRoot"
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg manifest install failed" }
+          }
+
+          # 2. 校验 hwcodec 硬件编解码必需的 ffmpeg (libavutil/pixfmt.h) 与 mfx-dispatch (libmfx.lib) 是否已就位
+          $pixfmtHeader = Join-Path $installRoot "x64-windows-static\include\libavutil\pixfmt.h"
+          $mfxLib = Join-Path $installRoot "x64-windows-static\lib\libmfx.lib"
+          if ((-not (Test-Path $pixfmtHeader)) -or (-not (Test-Path $mfxLib))) {
+            Write-Host "Installing ffmpeg:x64-windows-static and mfx-dispatch:x64-windows-static in classic mode..."
+            Push-Location $env:VCPKG_ROOT
+            & "$env:VCPKG_ROOT\vcpkg.exe" install `
+              libvpx:x64-windows-static `
+              libyuv:x64-windows-static `
+              opus:x64-windows-static `
+              aom:x64-windows-static `
+              ffmpeg:x64-windows-static `
+              mfx-dispatch:x64-windows-static `
+              --x-install-root="$installRoot"
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg classic install failed" }
+            Pop-Location
+          }
+
+          if (-not (Test-Path $pixfmtHeader)) {
+            throw "ERROR: $pixfmtHeader is still missing after vcpkg install!"
+          }
+          Write-Host "Verified hwcodec headers & static libs at: $pixfmtHeader"
+
+      - name: Setup LLVM (for bindgen & flutter_rust_bridge)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+            choco install -y llvm
+          }
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Setup Rust stable toolchain (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "rustdesk-src -> target"
+
+      - name: Setup Flutter (${{ env.FLUTTER_VERSION }})
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Replace engine with RustDesk custom Flutter engine (Windows x64)
+        shell: pwsh
+        working-directory: rustdesk-src
+        run: |
+          flutter config --enable-windows-desktop
+          flutter doctor -v
+          flutter precache --windows
+          $flutterBin = (Get-Command flutter.bat -ErrorAction SilentlyContinue).Source
+          if (-not $flutterBin) { $flutterBin = (Get-Command flutter).Source }
+          $flutterRoot = Split-Path (Split-Path $flutterBin -Parent) -Parent
+          $engineDir = Join-Path $flutterRoot "bin\cache\artifacts\engine\windows-x64-release"
+          Write-Host "Replacing Flutter Windows x64 engine in: $engineDir"
+          Invoke-WebRequest -Uri "https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip" -OutFile "windows-x64-release.zip"
+          Expand-Archive -Path "windows-x64-release.zip" -DestinationPath $engineDir -Force
+          Remove-Item "windows-x64-release.zip" -Force
+
+      - name: Generate Flutter-Rust Bridge (FFI)
+        shell: pwsh
+        working-directory: rustdesk-src
+        run: |
+          if (-not (Get-Command flutter_rust_bridge_codegen -ErrorAction SilentlyContinue)) {
+            cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+            if ($LASTEXITCODE -ne 0) { throw "cargo install flutter_rust_bridge_codegen failed" }
+          }
+          Push-Location flutter
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { throw "flutter pub get failed" }
+          Pop-Location
+          flutter_rust_bridge_codegen --rust-input .\src\flutter_ffi.rs --dart-output .\flutter\lib\generated_bridge.dart --llvm-path "C:\Program Files\LLVM"
+          if ($LASTEXITCODE -ne 0) { throw "flutter_rust_bridge_codegen failed" }
+          # 修复 ffigen 在 Windows 下生成的 DartPort Bool/Uint8 签名差异（与官方 build.py ffi_bindgen_function_refactor 保持一致）
+          $bridgeDart = ".\flutter\lib\generated_bridge.dart"
+          if (Test-Path $bridgeDart) {
+            (Get-Content $bridgeDart -Raw -Encoding UTF8).Replace(
+              "ffi.NativeFunction<ffi.Bool Function(DartPort",
+              "ffi.NativeFunction<ffi.Uint8 Function(DartPort"
+            ) | Set-Content $bridgeDart -Encoding UTF8
+          }
+
+      - name: Build RustDesk Windows x64 & Bundle Drivers into Single EXE
+        shell: pwsh
+        working-directory: rustdesk-src
+        run: |
+          pip install -r libs/portable/requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install requirements.txt failed" }
+
+          # 1. 编译 Rust 核心库 (librustdesk.dll) 与 Flutter Windows 桌面端 (flutter\build\windows\x64\runner\Release)
+          python -X utf8 build.py --portable --flutter --hwcodec --vram --skip-portable-pack
+          if ($LASTEXITCODE -ne 0) { throw "build.py compilation failed with exit code $LASTEXITCODE" }
+
+          $releaseDir = "flutter\build\windows\x64\runner\Release"
+          if (-not (Test-Path "$releaseDir\rustdesk.exe")) {
+            throw "ERROR: $releaseDir\rustdesk.exe was not generated by flutter build windows!"
+          }
+
+          # 确保 librustdesk.dll 与 dylib_virtual_display.dll 均已拷入 Release 目录
+          if ((Test-Path "target\release\librustdesk.dll") -and (-not (Test-Path "$releaseDir\librustdesk.dll"))) {
+            Copy-Item "target\release\librustdesk.dll" "$releaseDir\librustdesk.dll" -Force
+          }
+          if ((Test-Path "target\release\deps\dylib_virtual_display.dll") -and (-not (Test-Path "$releaseDir\dylib_virtual_display.dll"))) {
+            Copy-Item "target\release\deps\dylib_virtual_display.dll" "$releaseDir\dylib_virtual_display.dll" -Force
+          }
+
+          # 2. 按照官方 flutter-build.yml 规范，将 Release 目录重命名为 .\rustdesk 并注入虚拟显示器驱动
+          if (Test-Path ".\rustdesk") { Remove-Item ".\rustdesk" -Recurse -Force }
+          Move-Item -Path $releaseDir -Destination ".\rustdesk" -Force
+
+          Invoke-WebRequest -Uri "https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip" -OutFile "usbmmidd_v2.zip"
+          Expand-Archive -Path "usbmmidd_v2.zip" -DestinationPath ".\rustdesk" -Force
+          Remove-Item "usbmmidd_v2.zip" -Force
+
+          Write-Host "=== Files inside .\rustdesk before portable packing ==="
+          Get-ChildItem ".\rustdesk" | Select-Object Name, Length | Format-Table -AutoSize
+
+          # 3. 进入 libs/portable 执行打包（注意 -f ../../rustdesk/ 末尾必须带斜杠，否则相对路径截断异常会导致只打出 <1MB 空壳）
+          Push-Location libs/portable
+          if (Test-Path "data.bin") { Remove-Item "data.bin" -Force }
+          # 强制重新编译 rustdesk-portable-packer，避免 Swatinem/rust-cache 复用旧空壳二进制
+          cargo clean -p rustdesk-portable-packer 2>$null
+          python -X utf8 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          if ($LASTEXITCODE -ne 0) { throw "generate.py portable packing failed" }
+          Pop-Location
+
+          Move-Item -Path "./target/release/rustdesk-portable-packer.exe" -Destination "./rustdesk-${{ env.VERSION }}-install.exe" -Force
+          Copy-Item "./rustdesk-${{ env.VERSION }}-install.exe" "./rustdesk-${{ env.VERSION }}-x86_64.exe" -Force
+
+          # 4. 校验最终生成的单文件 EXE 体积（正常包含 librustdesk.dll + flutter_windows.dll 压缩后应在 20MB 以上）
+          $exeItem = Get-Item "./rustdesk-${{ env.VERSION }}-x86_64.exe"
+          $sizeMB = [math]::Round($exeItem.Length / 1MB, 2)
+          Write-Host "Generated EXE size: $sizeMB MB ($($exeItem.Length) bytes)"
+          if ($exeItem.Length -lt 15MB) {
+            throw "ERROR: Generated EXE is abnormally small ($sizeMB MB < 15 MB)! Portable packing failed to embed Release payload."
+          }
+
+      - name: Sign and verify update metadata sidecars
+        shell: pwsh
+        working-directory: rustdesk-src
+        env:
+          RUSTDESK_UPDATE_ED25519_SEED: ${{ secrets.RUSTDESK_UPDATE_ED25519_SEED }}
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          VERSION: ${{ env.VERSION }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RUSTDESK_UPDATE_ED25519_SEED)) {
+            throw "Missing Actions secret RUSTDESK_UPDATE_ED25519_SEED"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RUSTDESK_UPDATE_ED25519_PUBLIC_KEY)) {
+            throw "Missing Actions variable RUSTDESK_UPDATE_ED25519_PUBLIC_KEY"
+          }
+          $exe = "./rustdesk-$($env:VERSION)-x86_64.exe"
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+
+          python -m pip install --only-binary=:all: --require-hashes -r ../custom-scripts/res/update/update_metadata_requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install update_metadata_requirements.txt failed" }
+
+          python -X utf8 res/update/generate_update_metadata.py check-key --rust-source src/update_metadata.rs
+          if ($LASTEXITCODE -ne 0) { throw "update metadata key check failed" }
+
+          $publishedAt = (git log -1 --format=%cI).Trim()
+          if ([string]::IsNullOrWhiteSpace($publishedAt)) { throw "failed to read published-at from git" }
+
+          python -X utf8 res/update/generate_update_metadata.py sign `
+            --artifact windows x86_64 exe $exe `
+            --version $env:VERSION `
+            --release-id $env:VERSION `
+            --package-id rustdesk `
+            --release-base-url "https://github.com/${{ github.repository }}/releases/download" `
+            --published-at $publishedAt `
+            --metadata-out ./rustdesk-update.json `
+            --signature-out ./rustdesk-update.json.sig
+          if ($LASTEXITCODE -ne 0) { throw "signing rustdesk-update.json failed" }
+
+          python -X utf8 res/update/generate_update_metadata.py verify `
+            --metadata ./rustdesk-update.json `
+            --signature ./rustdesk-update.json.sig `
+            --artifact $exe `
+            --version $env:VERSION `
+            --release-id $env:VERSION `
+            --package-id rustdesk `
+            --release-base-url "https://github.com/${{ github.repository }}/releases/download"
+          if ($LASTEXITCODE -ne 0) { throw "verifying rustdesk-update.json failed" }
+
+          Write-Host "Signed update metadata sidecars are ready."
+
+      - name: Publish to GitHub Releases (Auto-Update Endpoint)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "${{ env.CUSTOM_APP_NAME }} ${{ env.VERSION }}"
+          body: |
+            基于官方 RustDesk `${{ env.VERSION }}` 自动同步编译的 **${{ env.CUSTOM_APP_NAME }}** 客户端：
+            - **软件名称**：`${{ env.CUSTOM_APP_NAME }}`
+            - **Windows**：64 位安装包与便携版（`rustdesk-${{ env.VERSION }}-install.exe` / `rustdesk-${{ env.VERSION }}-x86_64.exe`）。无感被控（隐藏被控端连接管理弹窗），并已清理部分官方界面提示。
+            - **Android**：`rustdesk-${{ env.VERSION }}-aarch64.apk`（主流 64 位手机）、`rustdesk-${{ env.VERSION }}-armv7.apk`（较旧 32 位手机）、`rustdesk-${{ env.VERSION }}-x86_64.apk`（模拟器）以及 `rustdesk-${{ env.VERSION }}-universal.apk`（多 ABI 合一）。应用 ID 为 `${{ env.APPLICATION_ID }}`，可与官方 RustDesk 同时安装。
+            - **自动更新（仅 Windows）**：检查更新与下载地址指向 `${{ github.repository }}`，并发布带签名的 `rustdesk-update.json` 元数据。官方 Android 客户端不会使用该 sidecar，请从 Releases 手动安装新的 APK。
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            rustdesk-src/rustdesk-${{ env.VERSION }}-x86_64.exe
+            rustdesk-src/rustdesk-${{ env.VERSION }}-install.exe
+            rustdesk-src/rustdesk-update.json
+            rustdesk-src/rustdesk-update.json.sig
+
+  # ============================================================================
+  # 阶段 3：生成 Android 所需的 Flutter-Rust Bridge 产物（与官方 bridge.yml 对齐）
+  # ============================================================================
+  generate-android-bridge:
+    name: Generate Android Flutter-Rust Bridge
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.check-upstream.outputs.version }}
+      FLUTTER_RUST_BRIDGE_VERSION: ${{ needs.check-upstream.outputs.frb_version }}
+      RUST_VERSION: ${{ needs.check-upstream.outputs.rust_version }}
+      CUSTOM_APP_NAME: ${{ github.event.inputs.app_name || '本地互联' }}
+      APPLICATION_ID: ${{ github.event.inputs.application_id || 'com.s1oz.bendihulian' }}
+      CARGO_EXPAND_VERSION: "1.0.95"
+      BRIDGE_FLUTTER_VERSION: "3.22.3"
+    steps:
+      - name: Checkout current repository (for patch_rustdesk.py)
+        uses: actions/checkout@v4
+        with:
+          path: custom-scripts
+
+      - name: Clone official rustdesk/rustdesk at tag ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          git clone --branch "${VERSION}" --depth 1 --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
+
+      - name: Apply custom patch
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RELAY_SERVER: ${{ secrets.RELAY_SERVER }}
+          API_SERVER: ${{ secrets.API_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -X utf8 custom-scripts/patch_rustdesk.py \
+            --root rustdesk-src \
+            --repo "${GITHUB_REPOSITORY}" \
+            --app-name "${CUSTOM_APP_NAME}" \
+            --application-id "${APPLICATION_ID}"
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-bridge-android
+          workspaces: rustdesk-src
+
+      - name: Install flutter (bridge generation uses official 3.22.3)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.BRIDGE_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install flutter rust bridge deps
+        working-directory: rustdesk-src
+        run: |
+          set -euo pipefail
+          cargo install cargo-expand --version "${CARGO_EXPAND_VERSION}" --locked
+          cargo install flutter_rust_bridge_codegen --version "${FLUTTER_RUST_BRIDGE_VERSION}" --features "uuid" --locked
+          # Official default bridge (Flutter 3.22.3): extended_text 14 needs a newer Dart.
+          if [ "${BRIDGE_FLUTTER_VERSION}" = "3.22.3" ]; then
+            sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          fi
+          pushd flutter
+          flutter pub get
+          popd
+
+      - name: Run flutter rust bridge
+        working-directory: rustdesk-src
+        run: |
+          set -euo pipefail
+          flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          if [ -f ./flutter/macos/Runner/bridge_generated.h ]; then
+            mkdir -p ./flutter/ios/Runner
+            cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+          fi
+
+      - name: Stage bridge artifacts
+        working-directory: rustdesk-src
+        run: |
+          set -euo pipefail
+          if [ ! -f src/bridge_generated.rs ] || [ ! -f flutter/lib/generated_bridge.dart ]; then
+            echo "flutter_rust_bridge_codegen did not produce the expected files"
+            ls -la src flutter/lib || true
+            exit 1
+          fi
+          mkdir -p bridge-out
+          copy_if_exists() {
+            local src="$1"
+            if [ -f "$src" ]; then
+              mkdir -p "bridge-out/$(dirname "$src")"
+              cp -f "$src" "bridge-out/$src"
+            fi
+          }
+          copy_if_exists src/bridge_generated.rs
+          copy_if_exists src/bridge_generated.io.rs
+          copy_if_exists flutter/lib/generated_bridge.dart
+          copy_if_exists flutter/lib/generated_bridge.freezed.dart
+          copy_if_exists flutter/macos/Runner/bridge_generated.h
+          copy_if_exists flutter/ios/Runner/bridge_generated.h
+          find bridge-out -type f
+
+      - name: Upload bridge artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-bridge-artifact
+          path: rustdesk-src/bridge-out/**
+          if-no-files-found: error
+
+  # ============================================================================
+  # 阶段 4：按 ABI 编译 Android APK，并用独立发行密钥签名后发布到同一 Release
+  # ============================================================================
+  build-android:
+    name: Build Android APK (${{ matrix.job.arch }})
+    needs: [check-upstream, generate-android-bridge]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { arch: aarch64, target: aarch64-linux-android, abi: arm64-v8a, platform: android-arm64, ndk_lib: aarch64-linux-android }
+          - { arch: armv7, target: armv7-linux-androideabi, abi: armeabi-v7a, platform: android-arm, ndk_lib: arm-linux-androideabi }
+          - { arch: x86_64, target: x86_64-linux-android, abi: x86_64, platform: android-x64, ndk_lib: x86_64-linux-android }
+    env:
+      VERSION: ${{ needs.check-upstream.outputs.version }}
+      FLUTTER_VERSION: ${{ needs.check-upstream.outputs.flutter_version }}
+      FLUTTER_RUST_BRIDGE_VERSION: ${{ needs.check-upstream.outputs.frb_version }}
+      VCPKG_COMMIT_ID: ${{ needs.check-upstream.outputs.vcpkg_commit }}
+      RUST_VERSION: ${{ needs.check-upstream.outputs.rust_version }}
+      NDK_VERSION: ${{ needs.check-upstream.outputs.ndk_version }}
+      CARGO_NDK_VERSION: ${{ needs.check-upstream.outputs.cargo_ndk_version }}
+      CUSTOM_APP_NAME: ${{ github.event.inputs.app_name || '本地互联' }}
+      APPLICATION_ID: ${{ github.event.inputs.application_id || 'com.s1oz.bendihulian' }}
+      ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Require Android release signing secrets
+        env:
+          ANDROID_ALIAS: ${{ secrets.ANDROID_ALIAS }}
+          ANDROID_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${ANDROID_SIGNING_KEY:-}" ]; then echo "missing secret: ANDROID_SIGNING_KEY"; missing=1; fi
+          if [ -z "${ANDROID_ALIAS:-}" ]; then echo "missing secret: ANDROID_ALIAS"; missing=1; fi
+          if [ -z "${ANDROID_KEY_STORE_PASSWORD:-}" ]; then echo "missing secret: ANDROID_KEY_STORE_PASSWORD"; missing=1; fi
+          if [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then echo "missing secret: ANDROID_KEY_PASSWORD"; missing=1; fi
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to publish a debug-signed or unsigned APK as a release."
+            exit 1
+          fi
+
+      - name: Export GitHub Actions cache environment variables (for vcpkg x-gha)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang cmake curl gcc-multilib git g++ g++-multilib \
+               libayatana-appindicator3-dev libasound2-dev libc6-dev libclang-dev \
+               libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev libpulse-dev libva-dev libxcb-randr0-dev libxcb-shape0-dev \
+               libxcb-xfixes0-dev libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
+               openjdk-17-jdk-headless pkg-config tree wget
+
+      - name: Checkout current repository (for patch_rustdesk.py)
+        uses: actions/checkout@v4
+        with:
+          path: custom-scripts
+
+      - name: Clone official rustdesk/rustdesk at tag ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          git clone --branch "${VERSION}" --depth 1 --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
+
+      - name: Apply custom patch
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RELAY_SERVER: ${{ secrets.RELAY_SERVER }}
+          API_SERVER: ${{ secrets.API_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -X utf8 custom-scripts/patch_rustdesk.py \
+            --root rustdesk-src \
+            --repo "${GITHUB_REPOSITORY}" \
+            --app-name "${CUSTOM_APP_NAME}" \
+            --application-id "${APPLICATION_ID}"
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter (dropdown enableFilter, official 3.24.5 only)
+        run: |
+          set -euo pipefail
+          PATCH_FILE="${GITHUB_WORKSPACE}/rustdesk-src/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if [ "${FLUTTER_VERSION}" = "3.24.5" ] && [ -f "${PATCH_FILE}" ]; then
+            (cd "$(dirname "$(dirname "$(which flutter)")")" && git apply "${PATCH_FILE}")
+          else
+            echo "Skipping Flutter dropdown patch (version=${FLUTTER_VERSION}, patch exists=$([ -f "${PATCH_FILE}" ] && echo yes || echo no))"
+          fi
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Setup vcpkg with GitHub Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        working-directory: rustdesk-src
+        run: |
+          set -euo pipefail
+          if ! ./flutter/build_android_deps.sh "${{ matrix.job.abi }}"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r logf; do
+              echo "${logf}:"
+              echo "======"
+              cat "${logf}"
+              echo "======"
+            done
+            exit 1
+          fi
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: android-bridge-artifact
+          path: android-bridge-artifact
+
+      - name: Place bridge files into rustdesk-src
+        run: |
+          set -euo pipefail
+          # Accept either a staged tree (src/..., flutter/...) or a nested prefix.
+          ROOT="android-bridge-artifact"
+          if [ -d "${ROOT}/bridge-out" ]; then ROOT="${ROOT}/bridge-out"; fi
+          if [ -d "${ROOT}/rustdesk-src" ]; then ROOT="${ROOT}/rustdesk-src"; fi
+          if [ ! -f "${ROOT}/src/bridge_generated.rs" ]; then
+            echo "bridge artifact layout unexpected:"
+            find android-bridge-artifact -type f | head -n 50
+            exit 1
+          fi
+          mkdir -p rustdesk-src/src rustdesk-src/flutter/lib rustdesk-src/flutter/macos/Runner rustdesk-src/flutter/ios/Runner
+          cp -f "${ROOT}/src/bridge_generated.rs" rustdesk-src/src/
+          cp -f "${ROOT}/src/bridge_generated.io.rs" rustdesk-src/src/
+          cp -f "${ROOT}/flutter/lib/generated_bridge.dart" rustdesk-src/flutter/lib/
+          if [ -f "${ROOT}/flutter/lib/generated_bridge.freezed.dart" ]; then
+            cp -f "${ROOT}/flutter/lib/generated_bridge.freezed.dart" rustdesk-src/flutter/lib/
+          fi
+          if [ -f "${ROOT}/flutter/macos/Runner/bridge_generated.h" ]; then
+            cp -f "${ROOT}/flutter/macos/Runner/bridge_generated.h" rustdesk-src/flutter/macos/Runner/
+          fi
+          if [ -f "${ROOT}/flutter/ios/Runner/bridge_generated.h" ]; then
+            cp -f "${ROOT}/flutter/ios/Runner/bridge_generated.h" rustdesk-src/flutter/ios/Runner/
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-lib-cache-android
+          key: ${{ matrix.job.target }}
+          workspaces: rustdesk-src
+
+      - name: Build rustdesk lib
+        working-directory: rustdesk-src
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.job.target }}"
+          cargo install cargo-ndk --version "${CARGO_NDK_VERSION}" --locked
+          case "${{ matrix.job.arch }}" in
+            aarch64) ./flutter/ndk_arm64.sh ;;
+            armv7) ./flutter/ndk_arm.sh ;;
+            x86_64) ./flutter/ndk_x64.sh ;;
+            *) echo "unsupported arch ${{ matrix.job.arch }}"; exit 1 ;;
+          esac
+          mkdir -p "./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}"
+          cp "./target/${{ matrix.job.target }}/release/liblibrustdesk.so" "./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}/librustdesk.so"
+
+      - name: Upload Rustdesk library to Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: librustdesk.so.${{ matrix.job.target }}
+          path: rustdesk-src/target/${{ matrix.job.target }}/release/liblibrustdesk.so
+          if-no-files-found: error
+
+      - name: Build rustdesk APK
+        working-directory: rustdesk-src
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          export PATH="${JAVA_HOME}/bin:${PATH}"
+          if [ ! -d "${JAVA_HOME}" ]; then
+            echo "JAVA_HOME ${JAVA_HOME} is missing"
+            exit 1
+          fi
+          if [ -f ./flutter/android/gradle.properties ]; then
+            sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          fi
+          # Intermediate APK uses the debug signingConfig so Gradle can assemble;
+          # the release keystore is applied in the following sign step.
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          if ! grep -q 'signingConfigs.debug' ./flutter/android/app/build.gradle; then
+            echo "failed to switch signingConfigs.release to debug for the intermediate APK"
+            exit 1
+          fi
+          mkdir -p "./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}"
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.job.ndk_lib }}/libc++_shared.so" "./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}/"
+          cp "./target/${{ matrix.job.target }}/release/liblibrustdesk.so" "./flutter/android/app/src/main/jniLibs/${{ matrix.job.abi }}/librustdesk.so"
+          pushd flutter
+          flutter build apk --release --target-platform "${{ matrix.job.platform }}" --split-per-abi
+          popd
+          APK_SRC="./flutter/build/app/outputs/flutter-apk/app-${{ matrix.job.abi }}-release.apk"
+          if [ ! -f "${APK_SRC}" ]; then
+            echo "flutter did not produce ${APK_SRC}"
+            ls -la ./flutter/build/app/outputs/flutter-apk/ || true
+            exit 1
+          fi
+          mkdir -p "${GITHUB_WORKSPACE}/signed-apk"
+          cp "${APK_SRC}" "${GITHUB_WORKSPACE}/signed-apk/rustdesk-${VERSION}-${{ matrix.job.arch }}.apk"
+
+      - name: Setup sign tool version variable
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=${BUILD_TOOL_VERSION}" >> "${GITHUB_ENV}"
+          echo "Last build tool version is: ${BUILD_TOOL_VERSION}"
+
+      - name: Sign app APK
+        uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407
+        id: sign-rustdesk
+        with:
+          releaseDirectory: ./signed-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
+
+      - name: Rename signed APK
+        id: apk
+        run: |
+          set -euo pipefail
+          SIGNED="${{ steps.sign-rustdesk.outputs.signedReleaseFile }}"
+          DEST="${GITHUB_WORKSPACE}/rustdesk-${VERSION}-${{ matrix.job.arch }}.apk"
+          if [ -z "${SIGNED}" ] || [ ! -f "${SIGNED}" ]; then
+            echo "signing did not produce a signed APK at '${SIGNED}'"
+            ls -la signed-apk || true
+            exit 1
+          fi
+          cp "${SIGNED}" "${DEST}"
+          echo "path=${DEST}" >> "${GITHUB_OUTPUT}"
+          ls -lh "${DEST}"
+
+      - name: Publish signed APK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "${{ env.CUSTOM_APP_NAME }} ${{ env.VERSION }}"
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.apk.outputs.path }}
+
+  # ============================================================================
+  # 阶段 5：用各 ABI 的 librustdesk.so 组装 universal APK 并签名发布
+  # ============================================================================
+  build-android-universal:
+    name: Build Android universal APK
+    needs: [check-upstream, build-android]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.check-upstream.outputs.version }}
+      FLUTTER_VERSION: ${{ needs.check-upstream.outputs.flutter_version }}
+      NDK_VERSION: ${{ needs.check-upstream.outputs.ndk_version }}
+      CUSTOM_APP_NAME: ${{ github.event.inputs.app_name || '本地互联' }}
+      APPLICATION_ID: ${{ github.event.inputs.application_id || 'com.s1oz.bendihulian' }}
+      ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Require Android release signing secrets
+        env:
+          ANDROID_ALIAS: ${{ secrets.ANDROID_ALIAS }}
+          ANDROID_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${ANDROID_SIGNING_KEY:-}" ]; then echo "missing secret: ANDROID_SIGNING_KEY"; missing=1; fi
+          if [ -z "${ANDROID_ALIAS:-}" ]; then echo "missing secret: ANDROID_ALIAS"; missing=1; fi
+          if [ -z "${ANDROID_KEY_STORE_PASSWORD:-}" ]; then echo "missing secret: ANDROID_KEY_STORE_PASSWORD"; missing=1; fi
+          if [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then echo "missing secret: ANDROID_KEY_PASSWORD"; missing=1; fi
+          if [ "$missing" -ne 0 ]; then
+            echo "Refusing to publish a debug-signed or unsigned APK as a release."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang cmake curl gcc-multilib git g++ g++-multilib \
+               libayatana-appindicator3-dev libasound2-dev libc6-dev libclang-dev \
+               libunwind-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev libpulse-dev libva-dev libxcb-randr0-dev libxcb-shape0-dev \
+               libxcb-xfixes0-dev libxdo-dev libxfixes-dev llvm-dev nasm ninja-build \
+               openjdk-17-jdk-headless pkg-config tree wget
+
+      - name: Checkout current repository (for patch_rustdesk.py)
+        uses: actions/checkout@v4
+        with:
+          path: custom-scripts
+
+      - name: Clone official rustdesk/rustdesk at tag ${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          git clone --branch "${VERSION}" --depth 1 --recurse-submodules https://github.com/rustdesk/rustdesk.git rustdesk-src
+
+      - name: Apply custom patch
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUSTDESK_UPDATE_ED25519_PUBLIC_KEY: ${{ vars.RUSTDESK_UPDATE_ED25519_PUBLIC_KEY }}
+          RENDEZVOUS_SERVER: ${{ secrets.RENDEZVOUS_SERVER }}
+          RELAY_SERVER: ${{ secrets.RELAY_SERVER }}
+          API_SERVER: ${{ secrets.API_SERVER }}
+          RS_PUB_KEY: ${{ secrets.RS_PUB_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -X utf8 custom-scripts/patch_rustdesk.py \
+            --root rustdesk-src \
+            --repo "${GITHUB_REPOSITORY}" \
+            --app-name "${CUSTOM_APP_NAME}" \
+            --application-id "${APPLICATION_ID}"
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter (dropdown enableFilter, official 3.24.5 only)
+        run: |
+          set -euo pipefail
+          PATCH_FILE="${GITHUB_WORKSPACE}/rustdesk-src/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          if [ "${FLUTTER_VERSION}" = "3.24.5" ] && [ -f "${PATCH_FILE}" ]; then
+            (cd "$(dirname "$(dirname "$(which flutter)")")" && git apply "${PATCH_FILE}")
+          else
+            echo "Skipping Flutter dropdown patch (version=${FLUTTER_VERSION}, patch exists=$([ -f "${PATCH_FILE}" ] && echo yes || echo no))"
+          fi
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: android-bridge-artifact
+          path: android-bridge-artifact
+
+      - name: Place bridge files into rustdesk-src
+        run: |
+          set -euo pipefail
+          # Accept either a staged tree (src/..., flutter/...) or a nested prefix.
+          ROOT="android-bridge-artifact"
+          if [ -d "${ROOT}/bridge-out" ]; then ROOT="${ROOT}/bridge-out"; fi
+          if [ -d "${ROOT}/rustdesk-src" ]; then ROOT="${ROOT}/rustdesk-src"; fi
+          if [ ! -f "${ROOT}/src/bridge_generated.rs" ]; then
+            echo "bridge artifact layout unexpected:"
+            find android-bridge-artifact -type f | head -n 50
+            exit 1
+          fi
+          mkdir -p rustdesk-src/src rustdesk-src/flutter/lib rustdesk-src/flutter/macos/Runner rustdesk-src/flutter/ios/Runner
+          cp -f "${ROOT}/src/bridge_generated.rs" rustdesk-src/src/
+          cp -f "${ROOT}/src/bridge_generated.io.rs" rustdesk-src/src/
+          cp -f "${ROOT}/flutter/lib/generated_bridge.dart" rustdesk-src/flutter/lib/
+          if [ -f "${ROOT}/flutter/lib/generated_bridge.freezed.dart" ]; then
+            cp -f "${ROOT}/flutter/lib/generated_bridge.freezed.dart" rustdesk-src/flutter/lib/
+          fi
+          if [ -f "${ROOT}/flutter/macos/Runner/bridge_generated.h" ]; then
+            cp -f "${ROOT}/flutter/macos/Runner/bridge_generated.h" rustdesk-src/flutter/macos/Runner/
+          fi
+          if [ -f "${ROOT}/flutter/ios/Runner/bridge_generated.h" ]; then
+            cp -f "${ROOT}/flutter/ios/Runner/bridge_generated.h" rustdesk-src/flutter/ios/Runner/
+          fi
+
+      - name: Download Rustdesk library (aarch64)
+        uses: actions/download-artifact@v4
+        with:
+          name: librustdesk.so.aarch64-linux-android
+          path: rustdesk-src/flutter/android/app/src/main/jniLibs/arm64-v8a
+
+      - name: Download Rustdesk library (armv7)
+        uses: actions/download-artifact@v4
+        with:
+          name: librustdesk.so.armv7-linux-androideabi
+          path: rustdesk-src/flutter/android/app/src/main/jniLibs/armeabi-v7a
+
+      - name: Download Rustdesk library (x86_64)
+        uses: actions/download-artifact@v4
+        with:
+          name: librustdesk.so.x86_64-linux-android
+          path: rustdesk-src/flutter/android/app/src/main/jniLibs/x86_64
+
+      - name: Place native libraries
+        run: |
+          set -euo pipefail
+          place_so() {
+            local dest_dir="$1"
+            local found
+            found=$(find "${dest_dir}" -name 'liblibrustdesk.so' -type f | head -n 1 || true)
+            if [ -z "${found}" ]; then
+              echo "missing liblibrustdesk.so under ${dest_dir}"
+              find "${dest_dir}" -type f || true
+              exit 1
+            fi
+            mkdir -p "${dest_dir}"
+            if [ "${found}" != "${dest_dir}/liblibrustdesk.so" ]; then
+              cp -f "${found}" "${dest_dir}/liblibrustdesk.so"
+            fi
+          }
+          place_so rustdesk-src/flutter/android/app/src/main/jniLibs/arm64-v8a
+          place_so rustdesk-src/flutter/android/app/src/main/jniLibs/armeabi-v7a
+          place_so rustdesk-src/flutter/android/app/src/main/jniLibs/x86_64
+
+      - name: Build universal APK
+        working-directory: rustdesk-src
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          export PATH="${JAVA_HOME}/bin:${PATH}"
+          if [ ! -d "${JAVA_HOME}" ]; then
+            echo "JAVA_HOME ${JAVA_HOME} is missing"
+            exit 1
+          fi
+          if [ -f ./flutter/android/gradle.properties ]; then
+            sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          fi
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          if ! grep -q 'signingConfigs.debug' ./flutter/android/app/build.gradle; then
+            echo "failed to switch signingConfigs.release to debug for the intermediate APK"
+            exit 1
+          fi
+          mv ./flutter/android/app/src/main/jniLibs/arm64-v8a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+          mv ./flutter/android/app/src/main/jniLibs/armeabi-v7a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so" ./flutter/android/app/src/main/jniLibs/armeabi-v7a/
+          mv ./flutter/android/app/src/main/jniLibs/x86_64/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/x86_64/librustdesk.so
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/x86_64-linux-android/libc++_shared.so" ./flutter/android/app/src/main/jniLibs/x86_64/
+          pushd flutter
+          flutter build apk --release --target-platform android-arm64,android-arm,android-x64
+          popd
+          APK_SRC="./flutter/build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -f "${APK_SRC}" ]; then
+            echo "flutter did not produce ${APK_SRC}"
+            ls -la ./flutter/build/app/outputs/flutter-apk/ || true
+            exit 1
+          fi
+          mkdir -p "${GITHUB_WORKSPACE}/signed-apk"
+          cp "${APK_SRC}" "${GITHUB_WORKSPACE}/signed-apk/rustdesk-${VERSION}-universal.apk"
+
+      - name: Setup sign tool version variable
+        shell: bash
+        run: |
+          BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+          echo "ANDROID_SIGN_TOOL_VERSION=${BUILD_TOOL_VERSION}" >> "${GITHUB_ENV}"
+          echo "Last build tool version is: ${BUILD_TOOL_VERSION}"
+
+      - name: Sign app APK
+        uses: r0adkll/sign-android-release@349ebdef58775b1e0d8099458af0816dc79b6407
+        id: sign-rustdesk
+        with:
+          releaseDirectory: ./signed-apk
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        env:
+          BUILD_TOOLS_VERSION: ${{ env.ANDROID_SIGN_TOOL_VERSION }}
+
+      - name: Rename signed APK
+        id: apk
+        run: |
+          set -euo pipefail
+          SIGNED="${{ steps.sign-rustdesk.outputs.signedReleaseFile }}"
+          DEST="${GITHUB_WORKSPACE}/rustdesk-${VERSION}-universal.apk"
+          if [ -z "${SIGNED}" ] || [ ! -f "${SIGNED}" ]; then
+            echo "signing did not produce a signed APK at '${SIGNED}'"
+            ls -la signed-apk || true
+            exit 1
+          fi
+          cp "${SIGNED}" "${DEST}"
+          echo "path=${DEST}" >> "${GITHUB_OUTPUT}"
+          ls -lh "${DEST}"
+
+      - name: Publish signed APK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: "${{ env.CUSTOM_APP_NAME }} ${{ env.VERSION }}"
+          draft: false
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.apk.outputs.path }}
